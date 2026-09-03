@@ -8,6 +8,7 @@ export const quantizeTicksFor = (division: QuantizeDivision) => division === 'of
 const LOOKAHEAD_SECONDS = .1;
 const SCHEDULER_INTERVAL_MS = 25;
 const FIRST_BEAT_TOLERANCE_SECONDS = .12;
+const RECORDING_COMMIT_CATCH_UP_SECONDS = LOOKAHEAD_SECONDS + SCHEDULER_INTERVAL_MS / 1000;
 export const safeTempo = (tempo: number) => Number.isFinite(tempo) && tempo > 0 ? tempo : 120;
 
 export type DeckInstrument = 'drums' | 'bass' | 'chords' | 'lead';
@@ -559,6 +560,7 @@ export class SharedDeckTransport {
   private timeAnchor = 0;
   private tickAnchor = 0;
   private hasAnchor = false;
+  private committedCatchUps = new Set<string>();
   private readonly context: () => AudioContext | null;
   private readonly tempo: () => number;
   private readonly decks: { A: SingleDeck; B: SingleDeck };
@@ -663,6 +665,43 @@ export class SharedDeckTransport {
   }
 
   anchor() { return { startAt: this.timeAnchor, tickAnchor: this.tickAnchor, tempo: this.tempoValue, playing: this.playing }; }
+
+  catchUpCommittedEvents(deckId: 'A' | 'B', instrument: DeckInstrument, events: Array<DrumEvent | NoteEvent | ChordEvent>) {
+    const audio = this.context();
+    if (!audio || !this.playing || events.length === 0) return 0;
+    const now = audio.currentTime;
+    const currentTick = this.currentTick(now);
+    const cycleStart = Math.floor(currentTick / DECK_TICKS) * DECK_TICKS;
+    const lane = deckId === 'A' ? 'deckA' : 'deckB';
+    const profile = this.decks[deckId].profile(instrument);
+    let scheduled = 0;
+
+    events.forEach((event) => {
+      const occurrences = [cycleStart - DECK_TICKS + event.startTick, cycleStart + event.startTick, cycleStart + DECK_TICKS + event.startTick];
+      const occurrence = occurrences
+        .filter((tick) => tick >= 0 && tick < this.nextTick)
+        .map((tick) => ({ tick, at: this.timeAtTick(tick) }))
+        .filter(({ at }) => at >= now - RECORDING_COMMIT_CATCH_UP_SECONDS && at <= now + LOOKAHEAD_SECONDS)
+        .sort((a, b) => Math.abs(a.at - now) - Math.abs(b.at - now))[0];
+      if (!occurrence) return;
+      const key = `${deckId}:${event.id}:${occurrence.tick}`;
+      if (this.committedCatchUps.has(key)) return;
+      this.committedCatchUps.add(key);
+      const at = Math.max(occurrence.at, now + .005);
+      if (instrument === 'drums') {
+        const drum = event as DrumEvent;
+        this.playback.drum(drum.pad, drum.velocity, at, profile, lane);
+      } else if (instrument === 'chords') {
+        const chord = event as ChordEvent;
+        this.playback.chord(chord.pitches, chord.velocity ?? 1, playbackDurationSeconds(chord.durationTicks, chord.articulation, this.tempoValue), at, profile, lane);
+      } else {
+        const note = event as NoteEvent;
+        this.playback.note(instrument, note.pitch, note.velocity, playbackDurationSeconds(note.durationTicks, note.articulation, this.tempoValue), at, profile, lane);
+      }
+      scheduled += 1;
+    });
+    return scheduled;
+  }
 
   private schedule() {
     const audio = this.context();

@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { drumNames, Instrument, Parameter, DrumModel } from './audio';
 import { createAppEngine } from './engine-factory';
 import type { AudioEngine } from './synth/contract';
-import { DeckInstrument, DeckRecorder, DECK_TICKS, EIGHTH_NOTE_TICKS, RecordMode, SharedDeckTransport, safeTempo, type DeckSnapshot, type QuantizeDivision, type SingleDeck } from './deck';
+import { DeckInstrument, DeckRecorder, DECK_TICKS, EIGHTH_NOTE_TICKS, RecordMode, safeTempo, type DeckSnapshot, type QuantizeDivision, type SingleDeck } from './deck';
 import { MusicController } from './music-controller';
 import type { DeckId, TransferStyle } from './music-types';
 import { registerWebMcp } from './webmcp';
@@ -11,20 +11,15 @@ import { KeyboardPressRegistry, type KeyboardPress } from './keyboard-input';
 import { SPECTRUM_COLUMNS, SPECTRUM_MAX_FREQUENCY, SPECTRUM_MIN_FREQUENCY, SPECTRUM_ROWS, type FrequencyHistogramRecorder } from './frequency-history';
 import { ENVELOPE_FIELDS, envelopeDisplayBounds, envelopeDisplayValue, envelopeParameterValue, type EnvelopeFieldKey } from './envelope-controls';
 import { envelopePath, envelopePreviewGeometry, type EnvelopePreviewValues } from './envelope-preview';
-import { skipMissedMetronomeBeats } from './metronome-scheduler';
 import { buildLeadKeyboardLayout } from './lead-keyboard';
 import { chordVisualKey, playbackVisuals } from './playback-visuals';
 import { PLATTER_COAST_MS, platterAngleDegrees, platterCoastTicks, platterResumeOffset, shortestPlatterOffset, wrapPlatterTick } from './platter-motion';
 import { beginSwitchDirection, updateSwitchDirection, type SwitchDirectionState } from './switch-direction';
+import { MUSIC_PRESETS } from './music-catalog';
+import { deckPhasePosition, deckPhaseTick } from './deck-phase';
 import './styles.css';
 
-const presets: Record<Instrument, string[]> = {
-  drums: ['Clean', 'Classic', 'Soft', 'Tight', 'Industrial', 'Lo-fi', '808', 'Circuit', 'Glitch'],
-  bass: ['Sub', 'Rubber', 'Acid', 'Pluck', 'Pulse', 'Distorted'],
-  chords: ['Warm Pad', 'Soft Keys', 'Glass FM', 'Organ', 'Pluck', 'Wide Saw'],
-  lead: ['Bright Mono', 'Soft Sine', 'Pulse Lead', 'FM Bell', 'Distorted', 'Airy', 'Strings'],
-  metronome: ['Classic Click', 'Bright Click', 'Soft Tick', 'Wood Block', 'Digital', 'Low Tick'],
-};
+const presets = MUSIC_PRESETS;
 const defaults: Record<Instrument, string[]> = {
   drums: ['Punch', 'Tightness', 'Dirt', 'Room'], bass: ['Tone', 'Shape', 'Glide', 'Drive'],
   chords: ['Tone', 'Attack', 'Width', 'Space'], lead: ['Tone', 'Bite', 'Motion', 'Echo'],
@@ -54,7 +49,6 @@ const keyMap: Record<string, number> = { a: 60, w: 61, s: 62, e: 63, d: 64, f: 6
 const keyboardKeys = Object.keys(keyMap);
 const drumKeyboardMap = keyboardKeys.map((_, index) => index % drumNames.length);
 type Theme = 'light' | 'dark';
-
 const initialTheme = (): Theme => {
   try {
     const saved = window.localStorage.getItem('mc-beats-theme');
@@ -217,14 +211,9 @@ function App() {
   const [music] = useState(() => new MusicController(engine));
   const [showIntro, setShowIntro] = useState(true);
   const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [started, setStarted] = useState(false);
   const [playing, setPlaying] = useState(false);
-  const [metronomeOn, setMetronomeOn] = useState(false);
-  const [tempo, setTempo] = useState(120);
   const [tick, setTick] = useState(0);
-  const [deckPlaying, setDeckPlaying] = useState(false);
   const [resumeToken, setResumeToken] = useState(0);
-  const [deckPosition, setDeckPosition] = useState({ bar: 0, beat: 0, tick: 0 });
   const subscribeMusic = useCallback((listener: () => void) => music.subscribe(listener), [music]);
   const readActiveDeck = useCallback(() => music.getActiveDeck(), [music]);
   const activeDeck = useSyncExternalStore(subscribeMusic, readActiveDeck, readActiveDeck);
@@ -234,26 +223,18 @@ function App() {
   const [chordInversion, setChordInversion] = useState(0);
   const [recording, setRecording] = useState(false);
   const [lastTake, setLastTake] = useState('No take committed');
-  const [switchEffect, setSwitchEffect] = useState<TransferStyle>('blend');
-  const [keyRoot, setKeyRoot] = useState(2);
-  const [keyMode, setKeyMode] = useState<'major' | 'minor'>('minor');
   const [keyModeDraft, setKeyModeDraft] = useState(1);
-  const [quantize, setQuantize] = useState<QuantizeDivision>('1/8');
   const [crossfadeDraft, setCrossfadeDraft] = useState(0);
   const [humanSwitching, setHumanSwitching] = useState(false);
   const [switchDestination, setSwitchDestination] = useState<DeckId>('B');
   const switchDirection = useRef<SwitchDirectionState>({ destination: 'B', extreme: 0 });
   const [pressedShortcuts, setPressedShortcuts] = useState<Set<string>>(() => new Set());
   const [uiScale, setUiScale] = useState(() => Math.min(1, Math.max(1, window.innerWidth - 32) / 1440));
-  const [selected, setSelected] = useState<Record<Instrument, number>>({ drums: 0, bass: 0, chords: 0, lead: 0, metronome: 0 });
   const [, redraw] = useState(0);
-  const metronomeTimer = useRef<number | null>(null);
   const recordingTimer = useRef<number | null>(null);
-  const pausedForResume = useRef(false);
   const metronomeBeforeRecording = useRef(false);
   const deck = music.decks.A;
   const deckB = music.decks.B;
-  const deckTransport = useRef<SharedDeckTransport | null>(null);
   const [deckRecorders] = useState(() => ({
     A: new DeckRecorder(() => engine.context, () => engine.tempo, deck),
     B: new DeckRecorder(() => engine.context, () => engine.tempo, deckB),
@@ -267,10 +248,18 @@ function App() {
   const selectedChordQuality = chordQualities.find((quality) => quality.id === chordQuality) ?? chordQualities[0];
   const effectiveChordInversion = Math.min(chordInversion, selectedChordQuality.intervals.length - 1);
   const musicState = music.getState({ includeExecutedCues: true, includeLiveEvents: false });
-  const visualPhaseTick = deckTransport.current?.isPlaying() ? deckTransport.current.position().tick : deckPosition.tick;
-  const readPlatterTick = useCallback(() => deckRecorder.countInPositionTick() ?? deckTransport.current?.position().tick ?? deckPosition.tick, [deckPosition.tick, deckRecorder]);
+  const { tempo, keyRoot, keyMode, quantize, metronomeEnabled: metronomeOn, switchEffect } = musicState.projectSettings;
+  const selected = musicState.liveSound.presetIndexes;
+  const started = musicState.audio.state === 'running';
+  const transportPlaying = musicState.clock.running;
+  const countInPositionTick = deckRecorder.countInPositionTick();
+  const visualPhaseTick = deckPhaseTick(musicState.clock.deckPhaseTick, countInPositionTick);
+  const phaseTickRef = useRef(musicState.clock.deckPhaseTick);
+  phaseTickRef.current = musicState.clock.deckPhaseTick;
+  const readPlatterTick = useCallback(() => deckRecorder.countInPositionTick() ?? phaseTickRef.current, [deckRecorder]);
+  const visualPosition = deckPhasePosition(visualPhaseTick);
   const readTransferProgress = useCallback(() => music.getState({ includeExecutedCues: false, includeLiveEvents: false }).transfer?.progress ?? 1, [music]);
-  const playingVisuals = playbackVisuals({ decks: musicState.decks, phaseTick: visualPhaseTick, absoluteTick: musicState.clock.absoluteTick, crossfadePosition: musicState.crossfadePosition, solo: musicState.solo, playing: deckPlaying });
+  const playingVisuals = playbackVisuals({ decks: musicState.decks, phaseTick: visualPhaseTick, absoluteTick: musicState.clock.absoluteTick, crossfadePosition: musicState.crossfadePosition, solo: musicState.solo, playing: transportPlaying });
   const playingClass = (instrument: 'drums' | 'bass' | 'lead' | 'chords', value: number | string) => {
     if (!musicState.instrumentEnabled[instrument]) return '';
     const deckMutedForReplace = recording && recordMode === 'replace' && focusedInstrument === instrument;
@@ -287,7 +276,7 @@ function App() {
     const snapped = value >= .5 ? 1 : 0;
     keyModeDragging.current = false;
     setKeyModeDraft(snapped);
-    setKeyMode(snapped === 1 ? 'minor' : 'major');
+    music.setProjectSettings({ keyMode: snapped === 1 ? 'minor' : 'major' });
   };
 
   useEffect(() => {
@@ -310,7 +299,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!deckPlaying && musicState.solo?.status !== 'active') return;
+    if (!transportPlaying && musicState.solo?.status !== 'active') return;
     let frame = 0;
     let lastPaint = 0;
     const animatePlayback = (time: number) => {
@@ -322,7 +311,7 @@ function App() {
     };
     frame = window.requestAnimationFrame(animatePlayback);
     return () => window.cancelAnimationFrame(frame);
-  }, [deckPlaying, musicState.solo?.status]);
+  }, [transportPlaying, musicState.solo?.status]);
 
   useEffect(() => {
     const fit = () => setUiScale(Math.min(1, Math.max(1, window.innerWidth - 32) / 1440));
@@ -338,24 +327,24 @@ function App() {
 
   useEffect(() => { const unsubscribe = music.subscribe(() => redraw((n) => n + 1)); return () => { unsubscribe(); }; }, [music]);
 
+  const previousTransportRunning = useRef(musicState.clock.running);
+  useEffect(() => {
+    if (musicState.clock.running && !previousTransportRunning.current) setResumeToken((token) => token + 1);
+    previousTransportRunning.current = musicState.clock.running;
+  }, [musicState.clock.running]);
+
   useEffect(() => {
     let cleanedUp = false;
     const cleanup = () => {
       if (cleanedUp) return;
       cleanedUp = true;
-      if (metronomeTimer.current !== null) {
-        window.clearInterval(metronomeTimer.current);
-        metronomeTimer.current = null;
-      }
       if (recordingTimer.current !== null) {
         window.clearInterval(recordingTimer.current);
         recordingTimer.current = null;
       }
-      const transport = deckTransport.current;
-      transport?.stop();
       deckRecorders.A.cancel();
       deckRecorders.B.cancel();
-      (['drums', 'bass', 'chords', 'lead'] as DeckInstrument[]).forEach((instrument) => transport?.setMuted(instrument, false));
+      (['drums', 'bass', 'chords', 'lead'] as DeckInstrument[]).forEach((instrument) => music.setRecordingInstrumentMuted(instrument, false));
       pointerVoices.current.forEach((voice) => engine.releaseNote(voice.id));
       pointerVoices.current.clear();
       keyboardPresses.current.values().forEach((entry) => {
@@ -364,7 +353,6 @@ function App() {
       keyboardPresses.current.clear();
       engine.heldNotes.forEach((_, id) => engine.releaseNote(id));
       music.clearHumanHeldSilently();
-      deckTransport.current = null;
       music.dispose();
     };
     appCleanupHandlers.add(cleanup);
@@ -388,9 +376,8 @@ function App() {
   }, [chordInversion, effectiveChordInversion]);
 
   useEffect(() => {
-    (Object.keys(presets) as Instrument[]).forEach((instrument) => engine.loadPreset(instrument, 0));
-    redraw((n) => n + 1);
-  }, [engine]);
+    (Object.keys(presets) as Instrument[]).forEach((instrument) => music.setLiveSound({ instrument, presetId: presets[instrument][0] }));
+  }, [music]);
 
   useEffect(() => {
     const down = async (event: KeyboardEvent) => {
@@ -494,75 +481,11 @@ function App() {
     deckRecorders.B.setQuantization(quantize);
   }, [deckRecorders, quantize]);
 
-  useEffect(() => {
-    if (metronomeTimer.current !== null) window.clearInterval(metronomeTimer.current);
-    if (!metronomeOn || !started) return;
-    let beat = 0;
-    const beatLength = 60 / safeTempo(tempo);
-    let nextBeat = engine.context!.currentTime + .05;
-    const schedule = () => {
-      const now = engine.context?.currentTime ?? 0;
-      const recovered = skipMissedMetronomeBeats({ beat, nextBeat }, now, beatLength);
-      beat = recovered.beat;
-      nextBeat = recovered.nextBeat;
-      while (nextBeat <= now + .1) {
-        engine.metronome(beat % 4 === 0, nextBeat);
-        beat += 1;
-        nextBeat += beatLength;
-      }
-    };
-    schedule();
-    metronomeTimer.current = window.setInterval(schedule, 25);
-    return () => {
-      if (metronomeTimer.current !== null) window.clearInterval(metronomeTimer.current);
-      metronomeTimer.current = null;
-    };
-  }, [metronomeOn, started, tempo, engine]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const transport = deckTransport.current;
-      if (transport?.isPlaying()) {
-        setDeckPosition(transport.position());
-        return;
-      }
-      const countInBeat = deckRecorder.countInBeat();
-      if (countInBeat) {
-        setDeckPosition({ bar: 0, beat: countInBeat - 1, tick: 0 });
-        return;
-      }
-      const recordingPosition = deckRecorder.position();
-      if (recordingPosition) {
-        setDeckPosition(recordingPosition);
-        return;
-      }
-      if (transport) {
-        setDeckPosition(transport.position());
-        setDeckPlaying(false);
-      }
-    }, 100);
-    return () => window.clearInterval(timer);
-  }, [activeDeck, deckRecorder]);
-
   const start = async () => {
     if (engine.context?.state === 'running') {
-      setStarted(true);
       return { ok: true, code: 'AUDIO_ALREADY_STARTED', message: 'Audio is already running.', data: { started: true, state: engine.context.state } } as const;
     }
-    const result = await music.startAudio();
-    if (result.ok) setStarted(true);
-    return result;
-  };
-  const getDeckTransport = () => {
-    if (!deckTransport.current) deckTransport.current = music.transport;
-    return deckTransport.current;
-  };
-  const startDeckTransport = (transport: SharedDeckTransport) => {
-    const resuming = pausedForResume.current;
-    pausedForResume.current = false;
-    if (!transport.start()) return;
-    if (resuming) setResumeToken((token) => token + 1);
-    setDeckPlaying(true);
+    return music.startAudio();
   };
   const switchDeck = (nextDeck: DeckId) => {
     if (recording) return;
@@ -588,12 +511,12 @@ function App() {
     switchDirection.current = nextDirection;
     setSwitchDestination((current) => current === nextDirection.destination ? current : nextDirection.destination);
     setCrossfadeDraft(value);
-    music.humanSetCrossfade(value, switchEffect);
+    music.setCrossfader(value, switchEffect);
     redraw((n) => n + 1);
   };
   const finishCrossfade = (value: number) => {
     const snapped = value < .5 ? 0 : 1;
-    music.humanSetCrossfade(snapped, switchEffect);
+    music.setCrossfader(snapped, switchEffect);
     setCrossfadeDraft(snapped);
     setHumanSwitching(false);
     redraw((n) => n + 1);
@@ -630,56 +553,48 @@ function App() {
   };
   const seedDeck = () => {
     music.humanMutateDeck('A', seedDeckFor);
-    setDeckPosition({ bar: 0, beat: 0, tick: 0 });
     redraw((n) => n + 1);
   };
   const seedDeckB = () => { music.humanMutateDeck('B', seedDeckFor); redraw((n) => n + 1); };
   const toggleDeck = async () => {
     if (recording) {
       cancelRecording();
-      getDeckTransport().stop();
-      pausedForResume.current = true;
-      setDeckPlaying(false);
+      music.stopTransport();
       return;
     }
-    await start();
-    const transport = getDeckTransport();
-    if (transport.isPlaying()) {
-      transport.stop();
-      pausedForResume.current = true;
-      setDeckPlaying(false);
+    const audio = await start();
+    if (!audio.ok) return;
+    if (musicState.clock.running) {
+      music.stopTransport();
       return;
     }
-    startDeckTransport(transport);
+    await music.startTransport();
   };
   const clearDeck = () => {
-    getDeckTransport().stop();
-    pausedForResume.current = false;
-    music.humanMutateDeck('A', (target) => target.clear());
-    setDeckPlaying(false);
-    setDeckPosition({ bar: 0, beat: 0, tick: 0 });
+    music.stopTransport();
+    music.clearDeck('A');
     redraw((n) => n + 1);
   };
   const clearDeckB = () => {
-    getDeckTransport().stop();
-    pausedForResume.current = false;
-    music.humanMutateDeck('B', (target) => target.clear());
-    setDeckPlaying(false);
-    setDeckPosition({ bar: 0, beat: 0, tick: 0 });
+    music.stopTransport();
+    music.clearDeck('B');
     redraw((n) => n + 1);
   };
   const beginRecording = async () => {
-    await start();
-    pausedForResume.current = false;
+    const audio = await start();
+    if (!audio.ok) return;
     if (deckRecorder.begin(focusedInstrument, recordMode, 4)) {
       music.setHumanRecording(true, activeDeck, focusedInstrument);
-      const transport = getDeckTransport();
-      transport.setMuted(focusedInstrument, recordMode === 'replace');
       const recordingStartAt = deckRecorder.recordingStartAt();
-      transport.start(recordingStartAt);
-      setDeckPlaying(true);
+      const recordingTransport = music.startRecordingTransport(recordingStartAt, focusedInstrument, recordMode === 'replace');
+      if (!recordingTransport.ok) {
+        deckRecorder.cancel();
+        music.setHumanRecording(false);
+        setLastTake(`${recordingTransport.code}: ${recordingTransport.message}`);
+        return;
+      }
       metronomeBeforeRecording.current = metronomeOn;
-      setMetronomeOn(true);
+      music.setProjectSettings({ metronomeEnabled: true });
       setRecording(true);
       setLastTake(`Recording ${focusedInstrument}${recordMode === 'replace' ? ' (deck track muted)' : ' (overdub)'}`);
       recordingTimer.current = window.setInterval(() => {
@@ -693,19 +608,21 @@ function App() {
     const take = deckRecorder.buildTake();
     setRecording(false);
     if (take) {
-      getDeckTransport().setMuted(take.instrument, false);
       if (take.count > 0) {
         const committed = music.commitHumanRecording(activeDeck, take, engine.getSoundProfile(take.instrument, presets[take.instrument][selected[take.instrument]]));
+        music.setRecordingInstrumentMuted(take.instrument, false);
         if (!committed.ok) { music.setHumanRecording(false); setLastTake(`${committed.code}: ${committed.message}`); return; }
+        music.catchUpRecordingEvents(activeDeck, take.instrument, committed.data?.added ?? []);
       } else {
         music.setHumanRecording(false);
+        music.setRecordingInstrumentMuted(take.instrument, false);
       }
       setLastTake(`${take.count} ${take.instrument} event${take.count === 1 ? '' : 's'} committed (${take.mode})`);
-      setMetronomeOn(metronomeBeforeRecording.current);
+      music.setProjectSettings({ metronomeEnabled: metronomeBeforeRecording.current });
       redraw((n) => n + 1);
     }
   };
-  const cancelRecording = () => { if (recordingTimer.current !== null) window.clearInterval(recordingTimer.current); recordingTimer.current = null; const target = deckRecorder.targetInstrument(); deckRecorder.cancel(); music.setHumanRecording(false); getDeckTransport().setMuted(target, false); setRecording(false); setMetronomeOn(metronomeBeforeRecording.current); setLastTake('Take cancelled'); };
+  const cancelRecording = () => { if (recordingTimer.current !== null) window.clearInterval(recordingTimer.current); recordingTimer.current = null; const target = deckRecorder.targetInstrument(); deckRecorder.cancel(); music.setHumanRecording(false); music.setRecordingInstrumentMuted(target, false); setRecording(false); music.setProjectSettings({ metronomeEnabled: metronomeBeforeRecording.current }); setLastTake('Take cancelled'); };
   useEffect(() => {
     const performanceShortcut = (event: KeyboardEvent) => {
       if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -727,13 +644,11 @@ function App() {
   });
   const updateTempo = (value: number) => {
     if (!Number.isFinite(value) || value <= 0) return;
-    setTempo(value);
-    engine.tempo = value;
+    const updated = music.setProjectSettings({ tempo: value });
+    if (!updated.ok) return;
     if (deckRecorder.isRecording()) {
       deckRecorder.retime();
-      deckTransport.current?.retime(deckRecorder.recordingStartAt());
-    } else {
-      deckTransport.current?.retime();
+      music.retimeRecordingTransport(deckRecorder.recordingStartAt());
     }
   };
   const triggerDrum = async (index: number) => { await start(); const at = engine.context!.currentTime; engine.drum(index, at); music.humanDrumHit(index, 1, at); deckRecorder.recordDrum(index, 1, at); };
@@ -790,8 +705,8 @@ function App() {
     }
   };
 
-  const currentBar = deckPosition.bar + 1;
-  const currentBeat = deckPosition.beat + 1;
+  const currentBar = visualPosition.bar + 1;
+  const currentBeat = visualPosition.beat + 1;
   const statusCopy = recording
     ? (deckRecorder.countInBeat() ? `COUNT IN · ${deckRecorder.countInBeat()} / 4` : `RECORDING ${focusedInstrument.toUpperCase()}`)
     : musicState.solo?.status === 'active'
@@ -804,12 +719,10 @@ function App() {
   const statusProgress = countInBeat ? countInBeat / 4 : statusMode === 'switching' ? (humanSwitching ? crossfadeDraft : musicState.transfer?.progress ?? musicState.crossfadePosition) : musicState.clock.deckPhaseTick / DECK_TICKS;
   const liveSwitchProgress = statusMode === 'switching' && !humanSwitching;
   const switchingDecks = humanSwitching || musicState.transfer?.status === 'active';
-  const platterIsMoving = (deckId: DeckId) => deckPlaying && (deckId === activeDeck || switchingDecks);
+  const platterIsMoving = (deckId: DeckId) => transportPlaying && (deckId === activeDeck || switchingDecks);
   const platterCrossfade = humanSwitching ? crossfadeDraft : musicState.crossfadePosition;
   const setPresetFor = (instrument: Instrument) => (value: number) => {
-    engine.loadPreset(instrument, value);
-    setSelected((state) => ({ ...state, [instrument]: value }));
-    redraw((n) => n + 1);
+    music.setLiveSound({ instrument, presetId: presets[instrument][value] });
   };
   const sharedPanelProps = (instrument: DeckInstrument) => ({
     instrument,
@@ -819,6 +732,7 @@ function App() {
     selected: selected[instrument],
     setPreset: setPresetFor(instrument),
     engine,
+    music,
     redraw,
     enabled: musicState.instrumentEnabled[instrument],
     pendingToggle: musicState.instrumentControls[instrument].nextCue,
@@ -839,22 +753,26 @@ function App() {
           </aside>
           <aside className="deck-rail switch-rail">
             <label className={`deck-toggle ${musicState.transfer?.status === 'active' ? 'agent-moving' : ''}`}><span>B</span><input type="range" aria-label="Deck crossfader" min="0" max="1" step=".01" value={humanSwitching ? crossfadeDraft : musicState.crossfadePosition} disabled={recording} onPointerDown={(event) => { void start(); try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* unavailable */ } const direction = beginSwitchDirection(activeDeck, musicState.crossfadePosition); switchDirection.current = direction; setSwitchDestination(direction.destination); setCrossfadeDraft(musicState.crossfadePosition); setHumanSwitching(true); }} onChange={(event) => updateCrossfade(event.currentTarget.valueAsNumber)} onPointerUp={(event) => finishCrossfade(event.currentTarget.valueAsNumber)} onPointerCancel={(event) => finishCrossfade(event.currentTarget.valueAsNumber)} onLostPointerCapture={(event) => { if (humanSwitching) finishCrossfade(event.currentTarget.valueAsNumber); }} onKeyDown={(event) => { const next = event.key === 'Home' || event.key === 'ArrowDown' || event.key === 'ArrowLeft' ? 0 : event.key === 'End' || event.key === 'ArrowUp' || event.key === 'ArrowRight' ? 1 : null; if (next !== null) { event.preventDefault(); finishCrossfade(next); } }} /><span>A</span></label>
-            <details className="effect-switch"><summary aria-label={`Switch effect: ${switchEffect}`}><span>SWITCH FX</span><strong>{switchEffects.find((effect) => effect.style === switchEffect)?.label}</strong><i aria-hidden="true">⌄</i></summary><div className="switch-menu">{switchEffects.map((effect) => <button type="button" key={effect.style} onClick={(event) => { setSwitchEffect(effect.style); const details = event.currentTarget.closest('details'); if (details) details.open = false; }}>{effect.label}</button>)}</div></details>
+            <details className="effect-switch"><summary aria-label={`Switch effect: ${switchEffect}`}><span>SWITCH FX</span><strong>{switchEffects.find((effect) => effect.style === switchEffect)?.label}</strong><i aria-hidden="true">⌄</i></summary><div className="switch-menu">{switchEffects.map((effect) => <button type="button" key={effect.style} onClick={(event) => { music.setProjectSettings({ switchEffect: effect.style }); const details = event.currentTarget.closest('details'); if (details) details.open = false; }}>{effect.label}</button>)}</div></details>
           </aside>
           <div className="platters">
-            <DeckPlatter deck="A" snapshot={deck.snapshot()} activity={1 - platterCrossfade} playing={platterIsMoving('A')} resumeToken={resumeToken} countingIn={activeDeck === 'A' && countInBeat !== null} readPhaseTick={readPlatterTick} enabled={musicState.instrumentEnabled} tempo={tempo} onClear={clearDeck} locked={recording} />
-            <DeckPlatter deck="B" snapshot={deckB.snapshot()} activity={platterCrossfade} playing={platterIsMoving('B')} resumeToken={resumeToken} countingIn={activeDeck === 'B' && countInBeat !== null} readPhaseTick={readPlatterTick} enabled={musicState.instrumentEnabled} tempo={tempo} onClear={clearDeckB} locked={recording} />
+            <DeckPlatter deck="A" snapshot={deck.snapshot()} activity={1 - platterCrossfade} playing={platterIsMoving('A')} resumeToken={resumeToken} countingIn={activeDeck === 'A' && countInBeat !== null} readPhaseTick={readPlatterTick} enabled={musicState.instrumentEnabled} tempo={tempo} />
+            <DeckPlatter deck="B" snapshot={deckB.snapshot()} activity={platterCrossfade} playing={platterIsMoving('B')} resumeToken={resumeToken} countingIn={activeDeck === 'B' && countInBeat !== null} readPhaseTick={readPlatterTick} enabled={musicState.instrumentEnabled} tempo={tempo} />
             <div className="deck-meta" aria-label="Deck performance settings">
               <button className="theme-setting" type="button" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`} aria-pressed={theme === 'dark'} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}><span className={theme === 'light' ? 'active' : ''}>LIGHT</span><i aria-hidden="true" /><span className={theme === 'dark' ? 'active' : ''}>DARK</span></button>
               <label><input aria-label="Tempo" type="number" step="20" value={tempo} onChange={(event) => updateTempo(event.currentTarget.valueAsNumber)} onKeyDown={(event) => { if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); updateTempo(tempo + (event.key === 'ArrowUp' ? 20 : -20)); } else if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); } }} /><small>BPM</small></label>
-              <details ref={keySetting} className="deck-setting key-setting" onToggle={(event) => { if (event.currentTarget.open) setKeyModeDraft(keyMode === 'minor' ? 1 : 0); }}><summary><b>{keyLabel}</b><small>KEY</small></summary><div className="key-picker"><strong>{noteNames[keyRoot]} {keyMode.toUpperCase()}</strong><div className="key-root-dots" role="group" aria-label="Key tonic">{whiteKeyRoots.map((root, index) => <button type="button" className={`key-root-dot white-root ${root === keyRoot ? 'selected' : ''}`} style={{ left: `${(index + .5) / 7 * 100}%` }} aria-label={`${noteNames[root]} tonic`} aria-pressed={root === keyRoot} key={root} onClick={() => setKeyRoot(root)}>{noteNames[root]}</button>)}{pinkKeyRoots.map(({ root, left }) => <button type="button" className={`key-root-dot pink-root ${root === keyRoot ? 'selected' : ''}`} style={{ left: `${left}%` }} aria-label={`${noteNames[root]} tonic`} aria-pressed={root === keyRoot} key={root} onClick={() => setKeyRoot(root)}>{noteNames[root]}</button>)}</div><label className="key-mode-switch"><span className={keyModeDraft < .5 ? 'active' : ''}>MAJOR</span><input type="range" aria-label="Key mode" min="0" max="1" step=".01" value={keyModeDraft} onPointerDown={(event) => { keyModeDragging.current = true; try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* unavailable */ } }} onChange={(event) => setKeyModeDraft(event.currentTarget.valueAsNumber)} onPointerUp={(event) => finishKeyMode(event.currentTarget.valueAsNumber)} onPointerCancel={() => { keyModeDragging.current = false; setKeyModeDraft(keyMode === 'minor' ? 1 : 0); }} onLostPointerCapture={(event) => { if (keyModeDragging.current) finishKeyMode(event.currentTarget.valueAsNumber); }} onKeyDown={(event) => { const value = event.key === 'Home' || event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? 0 : event.key === 'End' || event.key === 'ArrowRight' || event.key === 'ArrowUp' ? 1 : null; if (value !== null) { event.preventDefault(); finishKeyMode(value); } }} /><span className={keyModeDraft >= .5 ? 'active' : ''}>MINOR</span></label></div></details>
-              <details className="deck-setting"><summary><b>{quantize.toUpperCase()}</b><small>QUANTISE</small></summary><div className="deck-setting-menu">{quantizeOptions.map((option) => <button type="button" className={option === quantize ? 'selected' : ''} key={option} onClick={(event) => { setQuantize(option); const details = event.currentTarget.closest('details'); if (details) details.open = false; }}>{option.toUpperCase()}</button>)}</div></details>
-              <button type="button" className={metronomeOn ? 'selected' : ''} onClick={() => { void start(); setMetronomeOn((on) => !on); }}><b>{metronomeOn ? 'ON' : 'OFF'}</b><small>CLICK</small></button>
+              <details ref={keySetting} className="deck-setting key-setting" onToggle={(event) => { if (event.currentTarget.open) setKeyModeDraft(keyMode === 'minor' ? 1 : 0); }}><summary><b>{keyLabel}</b><small>KEY</small></summary><div className="key-picker"><strong>{noteNames[keyRoot]} {keyMode.toUpperCase()}</strong><div className="key-root-dots" role="group" aria-label="Key tonic">{whiteKeyRoots.map((root, index) => <button type="button" className={`key-root-dot white-root ${root === keyRoot ? 'selected' : ''}`} style={{ left: `${(index + .5) / 7 * 100}%` }} aria-label={`${noteNames[root]} tonic`} aria-pressed={root === keyRoot} key={root} onClick={() => music.setProjectSettings({ keyRoot: root })}>{noteNames[root]}</button>)}{pinkKeyRoots.map(({ root, left }) => <button type="button" className={`key-root-dot pink-root ${root === keyRoot ? 'selected' : ''}`} style={{ left: `${left}%` }} aria-label={`${noteNames[root]} tonic`} aria-pressed={root === keyRoot} key={root} onClick={() => music.setProjectSettings({ keyRoot: root })}>{noteNames[root]}</button>)}</div><label className="key-mode-switch"><span className={keyModeDraft < .5 ? 'active' : ''}>MAJOR</span><input type="range" aria-label="Key mode" min="0" max="1" step=".01" value={keyModeDraft} onPointerDown={(event) => { keyModeDragging.current = true; try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* unavailable */ } }} onChange={(event) => setKeyModeDraft(event.currentTarget.valueAsNumber)} onPointerUp={(event) => finishKeyMode(event.currentTarget.valueAsNumber)} onPointerCancel={() => { keyModeDragging.current = false; setKeyModeDraft(keyMode === 'minor' ? 1 : 0); }} onLostPointerCapture={(event) => { if (keyModeDragging.current) finishKeyMode(event.currentTarget.valueAsNumber); }} onKeyDown={(event) => { const value = event.key === 'Home' || event.key === 'ArrowLeft' || event.key === 'ArrowDown' ? 0 : event.key === 'End' || event.key === 'ArrowRight' || event.key === 'ArrowUp' ? 1 : null; if (value !== null) { event.preventDefault(); finishKeyMode(value); } }} /><span className={keyModeDraft >= .5 ? 'active' : ''}>MINOR</span></label></div></details>
+              <details className="deck-setting"><summary><b>{quantize.toUpperCase()}</b><small>QUANTISE</small></summary><div className="deck-setting-menu">{quantizeOptions.map((option) => <button type="button" className={option === quantize ? 'selected' : ''} key={option} onClick={(event) => { music.setProjectSettings({ quantize: option }); const details = event.currentTarget.closest('details'); if (details) details.open = false; }}>{option.toUpperCase()}</button>)}</div></details>
+              <button type="button" className={metronomeOn ? 'selected' : ''} onClick={() => { void start(); music.setProjectSettings({ metronomeEnabled: !metronomeOn }); }}><b>{metronomeOn ? 'ON' : 'OFF'}</b><small>CLICK</small></button>
+              <div className="deck-clear-controls" aria-label="Clear decks">
+                <button className="deck-clear" type="button" aria-label="Clear Deck A" title="Clear Deck A" disabled={recording} onClick={clearDeck}><span>CLEAR</span><b>DECK A</b></button>
+                <button className="deck-clear" type="button" aria-label="Clear Deck B" title="Clear Deck B" disabled={recording} onClick={clearDeckB}><span>CLEAR</span><b>DECK B</b></button>
+              </div>
             </div>
           </div>
           <div className="status-row">
             <div className={`status-screen status-${statusMode}`}><span className="status-copy">{statusCopy}</span><StatusProgress progress={liveSwitchProgress ? 0 : statusProgress} readLiveProgress={liveSwitchProgress ? readTransferProgress : undefined} /><span className="transport-position"><b>BAR {String(currentBar).padStart(2, '0')}</b><b>BEAT {currentBeat}</b></span><span className={`status-dot ${recording ? 'recording' : ''}`} /></div>
-            <button className="round-action" type="button" aria-label={deckPlaying ? 'Pause' : 'Play'} onClick={toggleDeck}>{deckPlaying ? 'Ⅱ' : '▶'}</button>
+            <button className="round-action" type="button" aria-label={transportPlaying ? 'Pause' : 'Play'} onClick={toggleDeck}>{transportPlaying ? 'Ⅱ' : '▶'}</button>
             <div className="record-controls">
               <button className={`round-action record ${recording ? 'armed' : ''}`} type="button" aria-label={recording ? 'Commit recording' : 'Record'} onClick={recording ? commitRecording : beginRecording}><span /></button>
               <button className="record-mode" type="button" title={lastTake} disabled={recording} aria-label={`Recording mode: ${recordMode}`} onPointerDown={toggleRecordMode} onKeyDown={(event) => { if (!event.repeat && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); toggleRecordMode(); } }}>{recordMode === 'overdub' ? 'OVERDUB' : 'REPLACE'}</button>
@@ -867,7 +785,7 @@ function App() {
         </InstrumentPanel>
 
         <section className="instrument output" aria-label="Output monitor">
-          <OutputSpectrum recorder={music.histogram} started={started} engine={engine} redraw={redraw} />
+          <OutputSpectrum recorder={music.histogram} started={started} engine={engine} music={music} redraw={redraw} />
         </section>
 
         <InstrumentPanel title="Bass" primaryControls={['tone', 'shape', 'drive']} {...sharedPanelProps('bass')}>
@@ -901,7 +819,7 @@ const ringArc = (radius: number, startTick: number, durationTicks: number) => {
   return `M${start.x.toFixed(2)} ${start.y.toFixed(2)} A${radius} ${radius} 0 ${sweep > 180 ? 1 : 0} 1 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
 };
 
-function DeckPlatter({ deck, snapshot, activity, playing, resumeToken, countingIn, readPhaseTick, enabled, tempo, onClear, locked }: { deck: DeckId; snapshot: DeckSnapshot; activity: number; playing: boolean; resumeToken: number; countingIn: boolean; readPhaseTick: () => number; enabled: Record<DeckInstrument, boolean>; tempo: number; onClear: () => void; locked: boolean }) {
+function DeckPlatter({ deck, snapshot, activity, playing, resumeToken, countingIn, readPhaseTick, enabled, tempo }: { deck: DeckId; snapshot: DeckSnapshot; activity: number; playing: boolean; resumeToken: number; countingIn: boolean; readPhaseTick: () => number; enabled: Record<DeckInstrument, boolean>; tempo: number }) {
   const rotorRef = useRef<HTMLDivElement>(null);
   const phaseReaderRef = useRef(readPhaseTick);
   const displayTickRef = useRef<number | null>(null);
@@ -953,7 +871,6 @@ function DeckPlatter({ deck, snapshot, activity, playing, resumeToken, countingI
     { instrument: 'chords', radius: 20 },
   ];
   return <article className="deck" aria-label={`Deck ${deck}, four bars`}>
-    <button className="deck-clear" type="button" aria-label={`Clear Deck ${deck}`} title={`Clear Deck ${deck}`} disabled={locked} onClick={onClear}>×</button>
     <div className="platter" style={{ '--deck-active': Math.max(0, Math.min(1, activity)) } as CSSProperties}>
       <div ref={rotorRef} className="platter-rotor">
         <span className="radial radial-top" /><span className="radial radial-right" /><span className="radial radial-bottom" /><span className="radial radial-left" />
@@ -970,7 +887,7 @@ function DeckPlatter({ deck, snapshot, activity, playing, resumeToken, countingI
   </article>;
 }
 
-function EnvelopeMini({ instrument, parameters, engine, redraw }: { instrument: 'bass' | 'chords' | 'lead'; parameters: Record<string, Parameter>; engine: AudioEngine; redraw: (fn: (n: number) => number) => void }) {
+function EnvelopeMini({ instrument, parameters, music }: { instrument: 'bass' | 'chords' | 'lead'; parameters: Record<string, Parameter>; music: MusicController }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [dragging, setDragging] = useState<'attack' | 'decay' | 'release' | null>(null);
   const width = 240; const height = 72; const floor = 64;
@@ -981,7 +898,7 @@ function EnvelopeMini({ instrument, parameters, engine, redraw }: { instrument: 
   const releaseX = Math.max(decayX + 24, 224 - normal('releaseMs') * 70);
   const points = [{ x: 4, y: floor }, { x: attackX, y: 7 }, { x: decayX, y: sustainY }, { x: releaseX, y: sustainY }, { x: 236, y: floor }];
   const path = points.map((point, index) => `${index ? 'L' : 'M'} ${point.x} ${point.y}`).join(' ');
-  const setParameter = (name: EnvelopeFieldKey, ratio: number) => { const parameter = parameters[name]; engine.setParameter(instrument, name, parameter.min + Math.max(0, Math.min(1, ratio)) * (parameter.max - parameter.min)); redraw((n) => n + 1); };
+  const setParameter = (name: EnvelopeFieldKey, ratio: number) => { const parameter = parameters[name]; music.setLiveSound({ instrument, parameters: { [name]: parameter.min + Math.max(0, Math.min(1, ratio)) * (parameter.max - parameter.min) } }); };
   const move = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (!dragging || !svgRef.current) return;
     const rect = svgRef.current.getBoundingClientRect();
@@ -1026,7 +943,7 @@ const downloadSnapshot = (snapshot: unknown) => {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 };
 
-function OutputSpectrum({ recorder, started, engine, redraw }: { recorder: FrequencyHistogramRecorder; started: boolean; engine: AudioEngine; redraw: (fn: (n: number) => number) => void }) {
+function OutputSpectrum({ recorder, started, engine, music }: { recorder: FrequencyHistogramRecorder; started: boolean; engine: AudioEngine; music: MusicController; redraw: (fn: (n: number) => number) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const eqRef = useRef<SVGSVGElement>(null);
   const [draggingEq, setDraggingEq] = useState<number | null>(null);
@@ -1109,7 +1026,7 @@ function OutputSpectrum({ recorder, started, engine, redraw }: { recorder: Frequ
   }, [recorder, started]);
 
   const output = engine.outputControls;
-  const setOutput = (name: keyof typeof output, value: number) => { engine.setOutputControl(name, value); redraw((n) => n + 1); };
+  const setOutput = (name: keyof typeof output, value: number) => { music.setOutput({ [name]: value }); };
   const eqPoints = [output.eqLowDb, output.eqMidDb, output.eqHighDb].map((gain, index) => ({ x: 18 + index * 102, y: 38 - gain / 12 * 25 }));
   const eqPath = `M 0 ${eqPoints[0].y} Q ${eqPoints[0].x} ${eqPoints[0].y} ${eqPoints[1].x} ${eqPoints[1].y} T 240 ${eqPoints[2].y}`;
   const eqNames = ['eqLowDb', 'eqMidDb', 'eqHighDb'] as const;
@@ -1127,7 +1044,7 @@ function OutputSpectrum({ recorder, started, engine, redraw }: { recorder: Frequ
   </div>;
 }
 
-function EnvelopeEditor({ instrument, parameters, engine, redraw }: { instrument: 'bass' | 'chords' | 'lead'; parameters: Record<string, Parameter>; engine: AudioEngine; redraw: (fn: (n: number) => number) => void }) {
+function EnvelopeEditor({ instrument, parameters, music }: { instrument: 'bass' | 'chords' | 'lead'; parameters: Record<string, Parameter>; music: MusicController }) {
   const values: EnvelopePreviewValues = {
     attackMs: parameters.attackMs.value,
     decayMs: parameters.decayMs.value,
@@ -1136,8 +1053,7 @@ function EnvelopeEditor({ instrument, parameters, engine, redraw }: { instrument
   };
   const geometry = envelopePreviewGeometry(values);
   const update = (key: EnvelopeFieldKey, displayValue: number) => {
-    engine.setParameter(instrument, key, envelopeParameterValue(key, displayValue));
-    redraw((n) => n + 1);
+    music.setLiveSound({ instrument, parameters: { [key]: envelopeParameterValue(key, displayValue) } });
   };
   return <section className="envelope-editor" aria-labelledby={`envelope-${instrument}`}>
     <div className="envelope-head">
@@ -1164,22 +1080,22 @@ function EnvelopeEditor({ instrument, parameters, engine, redraw }: { instrument
   </section>;
 }
 
-function InstrumentPanel({ title, instrument, focused = false, onFocus, presets, selected, setPreset, engine, redraw, children, primaryControls, enabled, pendingToggle, onToggle, locked }: { title: string; instrument: DeckInstrument; focused?: boolean; onFocus?: () => void; presets: string[]; selected: number; setPreset: (value: number) => void; engine: AudioEngine; redraw: (fn: (n: number) => number) => void; children: ReactNode; primaryControls: string[]; enabled: boolean; pendingToggle: { cueId: string; enabled: boolean; at: { cycle: number; bar: number; tick: number }; ticksUntil: number } | null; onToggle: () => void; locked: boolean }) {
+function InstrumentPanel({ title, instrument, focused = false, onFocus, presets, selected, setPreset, engine, music, children, primaryControls, enabled, pendingToggle, onToggle, locked }: { title: string; instrument: DeckInstrument; focused?: boolean; onFocus?: () => void; presets: readonly string[]; selected: number; setPreset: (value: number) => void; engine: AudioEngine; music: MusicController; redraw: (fn: (n: number) => number) => void; children: ReactNode; primaryControls: string[]; enabled: boolean; pendingToggle: { cueId: string; enabled: boolean; at: { cycle: number; bar: number; tick: number }; ticksUntil: number } | null; onToggle: () => void; locked: boolean }) {
   const parameters = engine.parameters[instrument];
   const hasEnvelope = instrument === 'bass' || instrument === 'chords' || instrument === 'lead';
-  const setControl = (name: string, value: number) => { engine.setControl(instrument, name, value); redraw((n) => n + 1); };
+  const setControl = (name: string, value: number) => { music.setLiveSound({ instrument, controls: { [name]: value } }); };
   return <section className={`instrument ${instrument} ${focused ? 'is-focused' : 'is-muted'} ${locked ? 'recording-locked' : ''}`} aria-disabled={locked} onPointerDownCapture={(event) => { if (locked) { event.preventDefault(); event.stopPropagation(); } }} onPointerDown={() => { if (!locked) onFocus?.(); }}>
     <header className="instrument-header">
       <details className="instrument-preset boxed"><summary aria-label={`${title} preset`}><span>{title.toUpperCase()}:</span><b>{presets[selected].toUpperCase()}</b><i>⌄</i></summary><div className="preset-menu">{presets.map((preset, index) => <button type="button" className={selected === index ? 'selected' : ''} key={preset} onClick={(event) => { setPreset(index); const details = event.currentTarget.closest('details'); if (details) details.open = false; }}>{preset.toUpperCase()}</button>)}</div></details>
-      {hasEnvelope ? <EnvelopeMini instrument={instrument} parameters={parameters} engine={engine} redraw={redraw} /> : null}
-      <div className="compact-controls">{primaryControls.map((name) => <KnobControl key={name} label={name} value={engine.controls[instrument][name] ?? 0} onChange={(value) => setControl(name, value)} />)}<KnobControl label="volume" value={engine.volumes[instrument]} onChange={(value) => { engine.setVolume(instrument, value); redraw((n) => n + 1); }} /><button className={`power ${enabled ? 'on' : ''}`} type="button" aria-label={`${enabled ? 'Disable' : 'Enable'} ${title}`} aria-pressed={enabled} onClick={(event) => { event.stopPropagation(); onToggle(); }}>{pendingToggle && <small>{Math.max(1, Math.ceil(pendingToggle.ticksUntil / (EIGHTH_NOTE_TICKS * 8)))}</small>}</button></div>
+      {hasEnvelope ? <EnvelopeMini instrument={instrument} parameters={parameters} music={music} /> : null}
+      <div className="compact-controls">{primaryControls.map((name) => <KnobControl key={name} label={name} value={engine.controls[instrument][name] ?? 0} onChange={(value) => setControl(name, value)} />)}<KnobControl label="volume" value={engine.volumes[instrument]} onChange={(value) => { music.setLiveSound({ instrument, volume: value }); }} /><button className={`power ${enabled ? 'on' : ''}`} type="button" aria-label={`${enabled ? 'Disable' : 'Enable'} ${title}`} aria-pressed={enabled} onClick={(event) => { event.stopPropagation(); onToggle(); }}>{pendingToggle && <small>{Math.max(1, Math.ceil(pendingToggle.ticksUntil / (EIGHTH_NOTE_TICKS * 8)))}</small>}</button></div>
     </header>
     {children}
   </section>;
 }
 
-function ParameterControl({ instrument, presetIndex, name, parameter, engine, redraw }: { instrument: Instrument; presetIndex: number; name: string; parameter: Parameter; engine: AudioEngine; redraw: (fn: (n: number) => number) => void }) {
-  return <label className="parameter"><span>{parameter.label}<small>{parameter.unit || 'value'}</small></span><input type="range" min={parameter.min} max={parameter.max} step={parameter.step} value={parameter.value} onChange={(e) => { engine.setParameter(instrument, name, Number(e.target.value)); redraw((n) => n + 1); }} /><input className="number-input" type="number" min={parameter.min} max={parameter.max} step={parameter.step} value={parameter.value} onChange={(e) => { engine.setParameter(instrument, name, Number(e.target.value)); redraw((n) => n + 1); }} /><button type="button" className="reset" title={`Reset ${parameter.label} to preset default`} aria-label={`Reset ${parameter.label}`} onClick={() => { engine.resetParameter(instrument, presetIndex, name); redraw((n) => n + 1); }}>↺</button></label>;
+function ParameterControl({ instrument, presetIndex, name, parameter, music }: { instrument: Instrument; presetIndex: number; name: string; parameter: Parameter; music: MusicController }) {
+  return <label className="parameter"><span>{parameter.label}<small>{parameter.unit || 'value'}</small></span><input type="range" min={parameter.min} max={parameter.max} step={parameter.step} value={parameter.value} onChange={(e) => { music.setLiveSound({ instrument, parameters: { [name]: Number(e.target.value) } }); }} /><input className="number-input" type="number" min={parameter.min} max={parameter.max} step={parameter.step} value={parameter.value} onChange={(e) => { music.setLiveSound({ instrument, parameters: { [name]: Number(e.target.value) } }); }} /><button type="button" className="reset" title={`Reset ${parameter.label} to preset default`} aria-label={`Reset ${parameter.label}`} onClick={() => { music.resetLiveParameter(instrument, presetIndex, name); }}>↺</button></label>;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

@@ -60,6 +60,106 @@ test('shared transport preserves its platter position while paused', () => {
   else (globalThis as { window?: unknown }).window = previousWindow;
 });
 
+test('recording commit catches up a first-beat event after the lookahead passed it exactly once', () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  let runScheduler = () => {};
+  (globalThis as { window?: unknown }).window = { setInterval: (callback: () => void) => { runScheduler = callback; return 1; }, clearInterval: () => {} };
+  const context = { currentTime: 0 } as unknown as AudioContext;
+  const deck = new SingleDeck();
+  deck.addNote('lead', 55, 0, EIGHTH_NOTE_TICKS, 1, 1, 'existing');
+  const played: Array<{ pitch: number; at: number }> = [];
+  const transport = new SharedDeckTransport(
+    () => context,
+    () => 120,
+    { A: deck, B: new SingleDeck() },
+    { drum: () => {}, note: (_instrument, pitch, _velocity, _duration, at) => played.push({ pitch, at }), chord: () => {} },
+  );
+
+  try {
+    transport.start(0);
+    context.currentTime = 7.91;
+    runScheduler();
+    const committed = deck.addNote('lead', 60, 0, EIGHTH_NOTE_TICKS, 1, 1, 'recorded');
+    context.currentTime = 8.01;
+    assert.equal(transport.catchUpCommittedEvents('A', 'lead', [committed]), 1);
+    assert.equal(transport.catchUpCommittedEvents('A', 'lead', [committed]), 0);
+    runScheduler();
+    assert.equal(played.filter(({ pitch }) => pitch === 60).length, 1);
+    assert.ok(played.find(({ pitch }) => pitch === 60)!.at > context.currentTime);
+    assert.equal(played.filter(({ pitch, at }) => pitch === 55 && at === 8).length, 1);
+  } finally {
+    transport.stop();
+    if (previousWindow === undefined) delete (globalThis as { window?: unknown }).window;
+    else (globalThis as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test('recording commit does not catch up an event before the scheduler reaches its loop', () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  let runScheduler = () => {};
+  (globalThis as { window?: unknown }).window = { setInterval: (callback: () => void) => { runScheduler = callback; return 1; }, clearInterval: () => {} };
+  const context = { currentTime: 0 } as unknown as AudioContext;
+  const deck = new SingleDeck();
+  const played: number[] = [];
+  const transport = new SharedDeckTransport(
+    () => context,
+    () => 120,
+    { A: deck, B: new SingleDeck() },
+    { drum: () => {}, note: (_instrument, pitch) => played.push(pitch), chord: () => {} },
+  );
+
+  try {
+    transport.start(0);
+    context.currentTime = 7.5;
+    const committed = deck.addNote('lead', 60, 0, EIGHTH_NOTE_TICKS, 1, 1, 'recorded-early');
+    assert.equal(transport.catchUpCommittedEvents('A', 'lead', [committed]), 0);
+    context.currentTime = 7.91;
+    runScheduler();
+    assert.deepEqual(played, [60]);
+  } finally {
+    transport.stop();
+    if (previousWindow === undefined) delete (globalThis as { window?: unknown }).window;
+    else (globalThis as { window?: unknown }).window = previousWindow;
+  }
+});
+
+test('recording commit catch-up uses the normal drum, bass, and chord playback paths', () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  let runScheduler = () => {};
+  (globalThis as { window?: unknown }).window = { setInterval: (callback: () => void) => { runScheduler = callback; return 1; }, clearInterval: () => {} };
+  const context = { currentTime: 0 } as unknown as AudioContext;
+  const deck = new SingleDeck();
+  const played: string[] = [];
+  const transport = new SharedDeckTransport(
+    () => context,
+    () => 120,
+    { A: deck, B: new SingleDeck() },
+    {
+      drum: (pad) => played.push(`drum:${pad}`),
+      note: (instrument, pitch) => played.push(`${instrument}:${pitch}`),
+      chord: (pitches) => played.push(`chord:${pitches.join(',')}`),
+    },
+  );
+
+  try {
+    transport.start(0);
+    context.currentTime = 7.91;
+    runScheduler();
+    const drum = deck.addDrum(2, 0, 1, 'recorded-drum');
+    const bass = deck.addNote('bass', 36, 0, EIGHTH_NOTE_TICKS, 1, 1, 'recorded-bass');
+    const chord = deck.addChord('Dm', [50, 53, 57], 0, EIGHTH_NOTE_TICKS, 'root', 1, 'recorded-chord');
+    context.currentTime = 8.01;
+    assert.equal(transport.catchUpCommittedEvents('A', 'drums', [drum]), 1);
+    assert.equal(transport.catchUpCommittedEvents('A', 'bass', [bass]), 1);
+    assert.equal(transport.catchUpCommittedEvents('A', 'chords', [chord]), 1);
+    assert.deepEqual(played, ['drum:2', 'bass:36', 'chord:50,53,57']);
+  } finally {
+    transport.stop();
+    if (previousWindow === undefined) delete (globalThis as { window?: unknown }).window;
+    else (globalThis as { window?: unknown }).window = previousWindow;
+  }
+});
+
 test('recording supports sixteenth-note and unquantized grids', () => {
   assert.equal(quantizedStart(190, 120), 240);
   assert.equal(quantizedDuration(190, 260, 120), 120);

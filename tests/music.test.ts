@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DeckRecorder, SharedDeckTransport, SingleDeck, DECK_TICKS, EIGHTH_NOTE_TICKS, type RecordedTake } from '../src/deck.ts';
 import { BassVcaController, PERSISTENT_BASS_LANES, SynthEngine, bassLaneNoteIsAudibleAt, linearFadeValue } from '../src/audio.ts';
-import { BAR_TICKS, MusicController, absoluteTickOf, fractionalMidiOf, isMusicalTime, musicalTimeOf, planHeldRetriggerProbe, quantizeMusicalTime } from '../src/music-controller.ts';
+import { BAR_TICKS, SOLO_OPENING_TICKS, MusicController, absoluteTickOf, fractionalMidiOf, isMusicalTime, musicalTimeOf, planHeldRetriggerProbe, quantizeMusicalTime } from '../src/music-controller.ts';
 import { buildWebMcpTools, registerWebMcp } from '../src/webmcp.ts';
 import { KeyboardPressRegistry } from '../src/keyboard-input.ts';
 import type { DeckSoundProfile } from '../src/deck.ts';
 
 const time = (bar: number, tick = 0, cycle = 0) => ({ cycle, bar, tick });
+const soloOpening = (instrument: 'bass' | 'lead' = 'lead', prefix = 'opening') => [
+  { type: 'note' as const, id: `${prefix}-1`, offsetTicks: 0, instrument, durationTicks: EIGHTH_NOTE_TICKS, pitch: instrument === 'bass' ? 36 : 72, velocity: .8 },
+  { type: 'note' as const, id: `${prefix}-2`, offsetTicks: BAR_TICKS, instrument, durationTicks: EIGHTH_NOTE_TICKS, pitch: instrument === 'bass' ? 39 : 75, velocity: .8 },
+];
 const profileVariant = (source: DeckSoundProfile, presetId: string, volume: number, controlName = Object.keys(source.controls)[0]) => ({
   ...source,
   presetId,
@@ -234,6 +238,33 @@ test('the shared clock freezes on stop and retime preserves its absolute tick', 
   controller.dispose();
   if (previousWindow === undefined) delete (globalThis as { window?: unknown }).window;
   else (globalThis as { window?: unknown }).window = previousWindow;
+});
+
+test('controller owns normal and recording transport starts with one shared clock', async () => {
+  const previousWindow = (globalThis as { window?: unknown }).window;
+  (globalThis as { window?: unknown }).window = { setInterval: () => 1, clearInterval: () => {} };
+  const engine = new SynthEngine();
+  const context = { currentTime: 0, sampleRate: 48000, state: 'running', close: async () => {} } as unknown as AudioContext;
+  engine.context = context;
+  const controller = new MusicController(engine);
+  try {
+    const result = await controller.startTransport();
+    assert.equal(result.ok, true);
+    assert.equal(controller.getState().clock.running, true);
+    controller.stopTransport();
+    assert.equal(controller.getState().clock.running, false);
+    const recording = controller.startRecordingTransport(2, 'lead', true);
+    assert.equal(recording.ok, true);
+    assert.equal(controller.transport.isPlaying(), true);
+    assert.equal(controller.transport.anchor().startAt, 2);
+    assert.equal(controller.setRecordingInstrumentMuted('lead', false).ok, true);
+    assert.equal(controller.retimeRecordingTransport(3).ok, true);
+    assert.equal(controller.catchUpRecordingEvents('A', 'lead', []).ok, true);
+  } finally {
+    controller.dispose();
+    if (previousWindow === undefined) delete (globalThis as { window?: unknown }).window;
+    else (globalThis as { window?: unknown }).window = previousWindow;
+  }
 });
 
 test('cue actions are pending until explicitly executed and undo restores the transaction', () => {
@@ -789,7 +820,7 @@ test('cancelling a lookahead cue removes its pre-scheduled instrument automation
 test('solo note instruments must match the active solo instrument', () => {
   const controller = runningController();
   const profile: DeckSoundProfile = controller.engine.getSoundProfile('lead', 'test');
-  const start = controller.queueAction(time(2), { type: 'start-solo', soloId: 'bass-solo', instrument: 'bass', description: 'bass', lengthBars: 2, soundProfile: { ...profile, presetId: 'bass-test', controls: { ...controller.engine.controls.bass }, parameters: Object.fromEntries(Object.entries(controller.engine.parameters.bass).map(([key, value]) => [key, value.value])) } });
+  const start = controller.queueAction(time(2), { type: 'start-solo', soloId: 'bass-solo', instrument: 'bass', description: 'bass', lengthBars: 2, soundProfile: { ...profile, presetId: 'bass-test', controls: { ...controller.engine.controls.bass }, parameters: Object.fromEntries(Object.entries(controller.engine.parameters.bass).map(([key, value]) => [key, value.value])) }, initialEvents: soloOpening('bass', 'bass-opening') });
   assert.equal(start.ok, true);
   assert.equal(controller.executeCueNow(start.data!.cueId).ok, true);
   const cue = controller.queueAction(time(2, EIGHTH_NOTE_TICKS), { type: 'add-solo-events', soloId: 'bass-solo', events: [{ type: 'note', instrument: 'lead', start: time(2, EIGHTH_NOTE_TICKS * 3), durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
@@ -798,14 +829,67 @@ test('solo note instruments must match the active solo instrument', () => {
   controller.dispose();
 });
 
-test('state includes the explicit null musical key and both deck chord contexts', () => {
+test('state includes musical context, orchestration hints, and both deck chord contexts', () => {
   const controller = new MusicController(new SynthEngine());
   controller.decks.A.addChord('C', [48, 52, 55], 0, EIGHTH_NOTE_TICKS);
   controller.decks.B.addChord('G', [55, 59, 62], 0, EIGHTH_NOTE_TICKS);
   const state = controller.getState();
-  assert.equal(state.musicalKey, null);
+  assert.equal(state.musicalKey, 'Dm');
+  assert.deepEqual(state.projectSettings, { tempo: 120, keyRoot: 2, keyMode: 'minor', quantize: '1/8', metronomeEnabled: false, switchEffect: 'blend' });
+  controller.setMusicalContext({ label: 'Dm', root: 2, mode: 'minor', scalePitchClasses: [2, 4, 5, 7, 9, 10, 1] });
+  const keyed = controller.getState();
+  assert.equal(keyed.musicalKey, 'Dm');
+  assert.equal(keyed.musicalContext?.mode, 'minor');
+  assert.equal(keyed.orchestration.recommendedTargetDeck, 'B');
   assert.equal(state.chordContext.A.current?.event.symbol, 'C');
   assert.equal(state.chordContext.B.current?.event.symbol, 'G');
+  controller.dispose();
+});
+
+test('explicit early solo boundaries are respected while next bar remains the normal latest start', () => {
+  const controller = runningController();
+  const profile = controller.engine.getSoundProfile('lead', 'Bright Mono');
+  const early = controller.queueAction({ when: 'next-eighth' }, { type: 'start-solo', soloId: 'early', instrument: 'lead', description: 'early phrase', lengthBars: 2, soundProfile: profile, initialEvents: soloOpening('lead', 'early-opening') });
+  assert.equal(early.ok, true);
+  assert.equal(absoluteTickOf(early.data!.normalisedAt), EIGHTH_NOTE_TICKS);
+  controller.cancelCue(early.data!.cueId);
+  const normal = controller.queueAction({ when: 'next-bar' }, { type: 'start-solo', soloId: 'normal', instrument: 'lead', description: 'downbeat phrase', lengthBars: 2, soundProfile: profile, initialEvents: soloOpening('lead', 'normal-opening') });
+  assert.equal(normal.ok, true);
+  assert.equal(absoluteTickOf(normal.data!.normalisedAt), BAR_TICKS);
+  controller.dispose();
+});
+
+test('inactive decks prepare atomically and remain undoable', () => {
+  const controller = runningController();
+  const prepared = controller.prepareDeck('B', [
+    { instrument: 'drums', mode: 'replace', events: [{ type: 'drum', id: 'prep-kick', startTick: 0, pad: 0, velocity: .9 }] },
+    { instrument: 'lead', mode: 'replace', events: [{ type: 'note', id: 'prep-lead', instrument: 'lead', startTick: 0, durationTicks: EIGHTH_NOTE_TICKS, pitch: 74, velocity: .8 }] },
+  ]);
+  assert.equal(prepared.ok, true);
+  assert.equal(controller.decks.B.eventCount(), 2);
+  assert.equal(controller.prepareDeck('A', [{ instrument: 'drums', mode: 'replace', events: [] }]).code, 'ACTIVE_DECK_REQUIRES_CUE');
+  assert.equal(controller.undoLastAgentAction().ok, true);
+  assert.equal(controller.decks.B.eventCount(), 0);
+  controller.dispose();
+});
+
+test('relative solo phrases extend the locked two-bar opening while pending and active', () => {
+  const controller = runningController();
+  const profile = controller.engine.getSoundProfile('lead', 'Bright Mono');
+  const queued = controller.queueAction({ when: 'next-bar' }, { type: 'start-solo', soloId: 'stream', instrument: 'lead', description: 'streamed phrase', lengthBars: 4, soundProfile: profile, initialEvents: soloOpening('lead', 'stream-opening') });
+  assert.equal(queued.ok, true);
+  const locked = controller.stageSoloEvents('stream', [{ type: 'note', id: 'too-early', offsetTicks: BAR_TICKS, instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: .8 }]);
+  assert.equal(locked.code, 'SOLO_OPENING_LOCKED');
+  const staged = controller.stageSoloEvents('stream', [{ type: 'note', id: 'phrase-1', offsetTicks: SOLO_OPENING_TICKS, instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 76, velocity: .8 }]);
+  assert.equal(staged.ok, true);
+  const pending = controller.getState().pendingCues.find((cue) => cue.id === queued.data!.cueId)!;
+  assert.equal(pending.action.type, 'create-solo');
+  assert.equal(controller.executeCueNow(queued.data!.cueId).ok, true);
+  assert.equal(controller.getState().solo?.events[0].start.bar, 1);
+  assert.equal(controller.getState().solo?.events.length, 3);
+  const later = controller.stageSoloEvents('stream', [{ type: 'note', id: 'phrase-2', offsetTicks: SOLO_OPENING_TICKS + BAR_TICKS, instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 79, velocity: .8 }]);
+  assert.equal(later.ok, true);
+  assert.equal(controller.getState().solo?.events.length, 4);
   controller.dispose();
 });
 
@@ -819,18 +903,20 @@ test('unknown debug releases return NOTE_NOT_FOUND', () => {
   controller.dispose();
 });
 
-test('solo starts empty, accepts global events inside its window, and rejects events outside it', () => {
+test('solo starts with two atomic bars, locks them, and accepts later events inside its window', () => {
   const controller = runningController();
   const profile: DeckSoundProfile = controller.engine.getSoundProfile('lead', 'test');
-  const started = controller.queueAction(time(2), { type: 'start-solo', soloId: 's1', instrument: 'lead', description: 'test', lengthBars: 2, soundProfile: profile });
+  const started = controller.queueAction(time(2), { type: 'start-solo', soloId: 's1', instrument: 'lead', description: 'test', lengthBars: 4, soundProfile: profile, initialEvents: soloOpening('lead', 's1-opening') });
   assert.equal(started.ok, true);
   assert.equal(controller.executeCueNow(started.data!.cueId).ok, true);
-  assert.equal(controller.getState().solo?.events.length, 0);
-  const inside = controller.queueAction(time(2, 480), { type: 'add-solo-events', soloId: 's1', events: [{ type: 'note', id: 'solo-note', start: time(2, 960), instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
+  assert.equal(controller.getState().solo?.events.length, 2);
+  const locked = controller.queueAction(time(2, 480), { type: 'add-solo-events', soloId: 's1', events: [{ type: 'note', id: 'locked', start: time(3), instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
+  assert.equal(locked.code, 'SOLO_OPENING_LOCKED');
+  const inside = controller.queueAction(time(2, 480), { type: 'add-solo-events', soloId: 's1', events: [{ type: 'note', id: 'solo-note', start: time(4), instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
   assert.equal(inside.ok, true);
   assert.equal(controller.executeCueNow(inside.data!.cueId).ok, true);
-  assert.equal(controller.getState().solo?.events.length, 1);
-  const outside = controller.queueAction(time(3, 1440), { type: 'add-solo-events', soloId: 's1', events: [{ type: 'note', id: 'late', start: time(4), instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
+  assert.equal(controller.getState().solo?.events.length, 3);
+  const outside = controller.queueAction(time(5, 1440), { type: 'add-solo-events', soloId: 's1', events: [{ type: 'note', id: 'late', start: time(6), instrument: 'lead', durationTicks: EIGHTH_NOTE_TICKS, pitch: 72, velocity: 1 }] });
   assert.equal(outside.ok, true);
   assert.equal(controller.executeCueNow(outside.data!.cueId).ok, false);
   controller.dispose();
@@ -844,14 +930,177 @@ test('musical cues reject before audio and clock start', () => {
   controller.dispose();
 });
 
-test('WebMCP exposes all normal and debug tools with strict schemas', async () => {
+test('shared controller owns project, crossfader, deck clear, live sound, and output settings', () => {
+  const controller = new MusicController(new SynthEngine());
+  const project = controller.setProjectSettings({ tempo: 137, keyRoot: 0, keyMode: 'minor', quantize: '1/16', metronomeEnabled: true, switchEffect: 'dip' });
+  assert.equal(project.ok, true);
+  assert.equal(controller.getState().musicalKey, 'Cm');
+  assert.equal(controller.getState().clock.tempo, 137);
+  assert.equal(controller.getState().projectSettings.quantize, '1/16');
+  const invalidProject = controller.setProjectSettings({ tempo: 0 });
+  assert.equal(invalidProject.ok, false);
+  assert.equal(controller.getState().clock.tempo, 137);
+
+  const sound = controller.setLiveSound({ instrument: 'bass', presetId: 'Acid', controls: { tone: .2 }, volume: .7 });
+  assert.equal(sound.ok, true);
+  assert.equal(controller.getState().liveSound.presetIndexes.bass, 2);
+  assert.equal(controller.engine.controls.bass.tone, .2);
+  assert.equal(controller.engine.volumes.bass, .7);
+  const invalidSound = controller.setLiveSound({ instrument: 'bass', controls: { missing: .5 } });
+  assert.equal(invalidSound.ok, false);
+  assert.equal(controller.engine.controls.bass.tone, .2);
+
+  assert.equal(controller.setOutput({ masterVolume: .65, eqLowDb: -3, echoMix: .25 }).ok, true);
+  assert.equal(controller.getState().liveSound.output.masterVolume, .65);
+  assert.equal(controller.setCrossfader(.65, 'overlap').ok, true);
+  assert.equal(controller.getState().crossfadePosition, .65);
+
+  controller.decks.B.addNote('lead', 72, 0, EIGHTH_NOTE_TICKS);
+  const cleared = controller.clearDeck('B', ['lead']);
+  assert.equal(cleared.ok, true);
+  assert.equal(controller.decks.B.events('lead').length, 0);
+  assert.equal(controller.undoLastAgentAction().ok, true);
+  assert.equal(controller.decks.B.events('lead').length, 1);
+  controller.dispose();
+});
+
+test('agent brief is compact, tempo-aware, and includes human playing', () => {
+  const controller = runningController();
+  controller.humanNoteOn('human-lead', 'lead', 72, .8);
+  const brief = controller.getAgentBrief();
+  assert.equal(brief.protocolVersion, 3);
+  assert.equal(brief.timing.estimatedTokensPerBarAt30Tps, 60);
+  assert.equal(brief.transport.inactiveDeck, 'B');
+  assert.equal(brief.humanPlaying.held[0].id, 'human-lead');
+  assert.equal(brief.humanPlaying.recentEvents[0].type, 'note-on');
+  assert.equal(brief.recommendedActions.some((action) => action.tool === 'music_fill_inactive_deck'), true);
+  controller.dispose();
+});
+
+test('progression recipe resolves C minor degrees, ticks, patterns, and presets', () => {
+  const controller = new MusicController(new SynthEngine());
+  controller.setProjectSettings({ keyRoot: 0, keyMode: 'minor' });
+  const built = controller.fillInactiveDeck({ progression: [1, 4, 1, 5], drums: 'backbeat', drumHits: [{ bar: 1, beat: 1, eighth: 1, drum: 'open-hat', velocity: .6 }], bass: 'roots', chords: 'sustained', sounds: { bass: { presetId: 'Sub' }, chords: { presetId: 'Warm Pad' } } });
+  assert.equal(built.ok, true);
+  assert.equal(built.code, 'PROGRESSION_BUILT');
+  assert.deepEqual(controller.decks.B.events('chords').map((event) => event.symbol), ['Cm', 'Fm', 'Cm', 'Gm']);
+  assert.deepEqual(controller.decks.B.events('bass').map((event) => event.pitch), [36, 41, 36, 43]);
+  assert.equal(controller.decks.B.profile('bass')?.presetId, 'Sub');
+  assert.equal(controller.decks.B.events('drums').length > 30, true);
+  assert.equal(controller.decks.B.events('drums').some((event) => event.pad === 3 && event.startTick === EIGHTH_NOTE_TICKS), true);
+  const invalid = controller.buildProgression('B', { progression: ['ix'] });
+  assert.equal(invalid.ok, false);
+  assert.equal((invalid.data as { retryWith: { tool: string } }).retryWith.tool, 'music_build_progression');
+  controller.dispose();
+});
+
+test('guided solo resolves shorthand and section scheduling adds a later transfer', () => {
+  const controller = runningController();
+  controller.setProjectSettings({ keyRoot: 0, keyMode: 'minor' });
+  const guided = controller.startGuidedSolo({ soloId: 'guided', instrument: 'lead', lengthBars: 4, sound: { presetId: 'Bright Mono' }, openingNotes: [{ bar: 1, degree: 1, duration: '1/4' }, { bar: 2, degree: 3, duration: '1/4' }] });
+  assert.equal(guided.ok, true);
+  const guidedCue = controller.getState().pendingCues.find((cue) => cue.id === guided.data!.cueId)!;
+  assert.equal(guidedCue.action.type, 'create-solo');
+  if (guidedCue.action.type === 'create-solo') {
+    assert.deepEqual(guidedCue.action.events.map((event) => event.type === 'note' ? event.pitch : null), [60, 63]);
+    assert.equal(guidedCue.action.soundProfile.presetId, 'Bright Mono');
+  }
+  controller.cancelCue(guided.data!.cueId);
+  const section = controller.scheduleSection({ soloId: 'section', instrument: 'lead', lengthBars: 16, notes: [{ bar: 1, degree: 1 }, { bar: 2, degree: 3 }, { bar: 9, degree: 5 }], transfer: { destination: 'B', afterBars: 8, style: 'blend', durationBeats: 1 } });
+  assert.equal(section.ok, true);
+  assert.equal(section.data!.eventCount, 3);
+  assert.equal(section.data!.stagedEventCount, 1);
+  const transfer = controller.getState().pendingCues.find((cue) => cue.id === section.data!.transferCueId)!;
+  assert.equal(transfer.action.type, 'transfer-deck');
+  assert.equal(transfer.normalisedAt.bar, 9);
+  controller.dispose();
+});
+
+test('guided solo accepts later bars, reports the slower path, and rolls back invalid tails', () => {
+  const controller = runningController();
+  const extended = controller.startGuidedSolo({ soloId: 'extended-guided', instrument: 'lead', lengthBars: 6, openingNotes: [{ bar: 1, degree: 1 }, { bar: 2, degree: 3 }, { bar: 3, degree: 5 }, { bar: 6, degree: 1 }] });
+  assert.equal(extended.ok, true);
+  assert.equal(extended.data!.openingEventCount, 2);
+  assert.equal(extended.data!.stagedEventCount, 2);
+  assert.equal(extended.data!.usedExtendedInput, true);
+  const pending = controller.getState().pendingCues.find((cue) => cue.id === extended.data!.cueId)!;
+  assert.equal(pending.action.type, 'create-solo');
+  if (pending.action.type === 'create-solo') assert.equal(pending.action.events.length, 4);
+  controller.cancelCue(extended.data!.cueId);
+
+  const missingOpeningBar = controller.startGuidedSolo({ soloId: 'missing-opening', instrument: 'lead', lengthBars: 4, openingNotes: [{ bar: 1, degree: 1 }, { bar: 3, degree: 5 }] });
+  assert.equal(missingOpeningBar.ok, false);
+  assert.equal(controller.getState().pendingCues.some((cue) => cue.action.type === 'create-solo' && cue.action.soloId === 'missing-opening'), false);
+
+  const invalidTail = controller.startGuidedSolo({ soloId: 'invalid-tail', instrument: 'lead', lengthBars: 4, openingNotes: [{ bar: 1, degree: 1 }, { bar: 2, degree: 3 }, { bar: 5, degree: 5 }] });
+  assert.equal(invalidTail.ok, false);
+  assert.equal(controller.getState().pendingCues.some((cue) => cue.action.type === 'create-solo' && cue.action.soloId === 'invalid-tail'), false);
+  controller.dispose();
+});
+
+test('stable WebMCP controls cover the full non-performance UI surface', async () => {
   const controller = new MusicController(new SynthEngine());
   const tools = buildWebMcpTools(controller);
   const names = tools.map((tool) => tool.name);
-  assert.equal(names.length, 30);
+  for (const name of ['music_initialize_audio', 'music_get_catalog', 'music_set_project_settings', 'music_set_transport', 'music_set_crossfader', 'music_clear_deck', 'music_set_live_sound', 'music_set_output']) assert.ok(names.includes(name), name);
+  for (const omitted of ['music_perform', 'music_control_recording', 'music_import_project', 'music_export_project']) assert.equal(names.includes(omitted), false);
+  const projectTool = tools.find((tool) => tool.name === 'music_set_project_settings')!;
+  const projectResult = await projectTool.execute({ tempo: 144, keyRoot: 5, keyMode: 'major', quantize: '1/4', metronomeEnabled: false, switchEffect: 'cut' });
+  const projectPayload = JSON.parse((projectResult as { content: Array<{ text: string }> }).content[0].text) as { code: string };
+  assert.equal(projectPayload.code, 'PROJECT_SETTINGS_UPDATED');
+  assert.equal(controller.getState().musicalKey, 'F');
+  const catalogTool = tools.find((tool) => tool.name === 'music_get_catalog')!;
+  const catalogPayload = JSON.parse(((await catalogTool.execute({})) as { content: Array<{ text: string }> }).content[0].text) as { data: { presets: { lead: string[] } } };
+  assert.ok(catalogPayload.data.presets.lead.includes('Bright Mono'));
+  const outputTool = tools.find((tool) => tool.name === 'music_set_output')!;
+  const invalid = await outputTool.execute({ masterVolume: .5, unknown: 1 });
+  assert.equal(JSON.parse((invalid as { content: Array<{ text: string }> }).content[0].text).code, 'INVALID_INPUT');
+  controller.dispose();
+});
+
+test('high-level WebMCP recipes act through the controller and reject nested unknown fields', async () => {
+  const controller = runningController();
+  controller.setProjectSettings({ keyRoot: 0, keyMode: 'minor' });
+  controller.humanNoteOn('web-human', 'lead', 67, .7);
+  const tools = buildWebMcpTools(controller);
+  const call = async (name: string, input: unknown) => JSON.parse(((await tools.find((tool) => tool.name === name)!.execute(input)) as { content: Array<{ text: string }> }).content[0].text);
+  const brief = await call('music_get_agent_brief', {});
+  assert.equal(brief.data.humanPlaying.held[0].id, 'web-human');
+  const live = await call('music_get_live_feed', { sinceSequence: 0, maxEvents: 4 });
+  assert.equal(live.data.recentEvents[0].type, 'note-on');
+  const filled = await call('music_fill_inactive_deck', { progression: [1, 4, 1, 5], drums: 'backbeat', drumHits: [{ bar: 1, eighth: 1, drum: 'open-hat' }], bass: 'none', chords: 'sustained' });
+  assert.equal(filled.code, 'PROGRESSION_BUILT');
+  assert.equal(controller.decks.B.events('chords').length, 4);
+  assert.equal(controller.decks.B.events('drums').some((event) => event.pad === 3), true);
+  const badRecipe = await call('music_fill_inactive_deck', { progression: [1], sounds: { bass: { presetId: 'Sub', unknown: 1 } } });
+  assert.equal(badRecipe.code, 'INVALID_INPUT');
+  const guided = await call('music_start_guided_solo', { soloId: 'web-guided', instrument: 'lead', lengthBars: 4, openingNotes: [{ bar: 1, degree: 1 }, { bar: 2, degree: 3 }, { bar: 4, degree: 5 }] });
+  assert.equal(guided.code, 'CUE_ACCEPTED');
+  assert.equal(guided.data.stagedEventCount, 1);
+  controller.cancelCue(guided.data.cueId);
+  const section = await call('music_schedule_section', { soloId: 'web-section', instrument: 'lead', lengthBars: 12, notes: [{ bar: 1, degree: 1 }, { bar: 2, degree: 3 }, { bar: 7, degree: 5 }], transfer: { afterBars: 6, destination: 'B', style: 'blend', durationBeats: 1 } });
+  assert.equal(section.code, 'SECTION_SCHEDULED');
+  assert.equal(controller.getState().pendingCues.length, 2);
+  controller.dispose();
+});
+
+test('default WebMCP stays within the page limit and exposes normal tools with strict schemas', async () => {
+  const controller = new MusicController(new SynthEngine());
+  const tools = buildWebMcpTools(controller);
+  const names = tools.map((tool) => tool.name);
+  assert.equal(names.length, 31);
   assert.equal(new Set(names).size, names.length);
+  assert.equal(names.some((name) => name.startsWith('debug_')), false);
+  assert.equal(names.includes('music_start_transport'), false);
+  assert.equal(names.includes('music_stop_transport'), false);
+  for (const name of ['music_get_agent_brief', 'music_get_live_feed', 'music_build_progression', 'music_fill_inactive_deck', 'music_start_guided_solo', 'music_schedule_section']) assert.ok(names.includes(name), name);
   tools.forEach((tool) => assert.equal(tool.inputSchema.additionalProperties, false));
   const stateTool = tools.find((tool) => tool.name === 'music_get_state')!;
+  const guideTool = tools.find((tool) => tool.name === 'music_get_usage_guide')!;
+  const guide = JSON.parse((await guideTool.execute({ topic: 'soloStreaming' }) as { content: Array<{ text: string }> }).content[0].text);
+  assert.equal(guide.data.protocolVersion, 3);
+  assert.match(guide.data.soloStreaming.note, /Extra bars no longer cause failure/);
+  assert.equal(guide.data.realtimeBudget.estimatedTokensPerBarAt30Tps, 60);
   const stateResult = await stateTool.execute({ includeParameters: true });
   assert.equal((stateResult as { content: Array<{ text: string }> }).content.length, 1);
   const limitedState = await stateTool.execute({ includeLiveEvents: false, maxLiveEvents: 0 });
@@ -860,6 +1109,17 @@ test('WebMCP exposes all normal and debug tools with strict schemas', async () =
   const invalidStatePayload = JSON.parse((invalidState as { content: Array<{ text: string }> }).content[0].text) as { ok: boolean; code: string };
   assert.equal(invalidStatePayload.ok, false);
   assert.equal(invalidStatePayload.code, 'INVALID_INPUT');
+  controller.dispose();
+});
+
+test('debug WebMCP mode isolates diagnostics with only the essential read tools', () => {
+  const controller = new MusicController(new SynthEngine());
+  const tools = buildWebMcpTools(controller, 'debug');
+  const names = tools.map((tool) => tool.name);
+  assert.equal(names.length, 17);
+  assert.equal(names.filter((name) => !name.startsWith('debug_')).sort().join(','), 'music_get_agent_brief,music_get_catalog,music_get_state');
+  assert.equal(names.filter((name) => name.startsWith('debug_')).length, 14);
+  tools.forEach((tool) => assert.equal(tool.inputSchema.additionalProperties, false));
   controller.dispose();
 });
 
@@ -877,7 +1137,7 @@ test('WebMCP registration is optional and aborts all registrations on cleanup', 
   };
   const controller = new MusicController(new SynthEngine());
   const cleanup = await registerWebMcp(controller);
-  assert.equal(registered.length, 30);
+  assert.equal(registered.length, 31);
   cleanup();
   assert.equal(aborted, true);
   controller.dispose();
@@ -888,7 +1148,7 @@ test('WebMCP registration is optional and aborts all registrations on cleanup', 
 test('debug frequency conversion stays fractional and runtime rejects invalid optional values', async () => {
   assert.ok(Math.abs(fractionalMidiOf(466.16) - 70) < .001);
   const controller = new MusicController(new SynthEngine());
-  const tone = buildWebMcpTools(controller).find((tool) => tool.name === 'debug_play_tone')!;
+  const tone = buildWebMcpTools(controller, 'debug').find((tool) => tool.name === 'debug_play_tone')!;
   const invalid = await tone.execute({ frequencyHz: 440, durationMs: 100, gain: 1 });
   const payload = JSON.parse((invalid as { content: Array<{ text: string }> }).content[0].text) as { ok: boolean; code: string };
   assert.equal(payload.ok, false);
@@ -898,7 +1158,7 @@ test('debug frequency conversion stays fractional and runtime rejects invalid op
 
 test('live-path debug MCP tools reject use before audio and unknown fields', async () => {
   const controller = new MusicController(new SynthEngine());
-  const tools = buildWebMcpTools(controller);
+  const tools = buildWebMcpTools(controller, 'debug');
   const hold = tools.find((tool) => tool.name === 'debug_hold_instrument_frequency')!;
   const release = tools.find((tool) => tool.name === 'debug_release_held_note')!;
   const beforeAudio = await hold.execute({ id: 'bass-a', instrument: 'bass', frequencyHz: 55 });

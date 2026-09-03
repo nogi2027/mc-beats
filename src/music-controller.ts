@@ -1,17 +1,23 @@
-import { type DeckInstrument, type DeckSoundProfile, type DrumEvent, type NoteEvent, type ChordEvent, type RecordedTake, type RecordedTakeEvent, EIGHTH_NOTE_TICKS, DECK_TICKS, PPQ, BEATS_PER_BAR, SingleDeck, SharedDeckTransport, safeTempo, ticksToSeconds, playbackDurationSeconds } from './deck.ts';
-import type { AudioEngine, Instrument, VoiceLane } from './synth/contract.ts';
+import { type DeckInstrument, type DeckSoundProfile, type DrumEvent, type NoteEvent, type ChordEvent, type RecordedTake, type RecordedTakeEvent, type QuantizeDivision, EIGHTH_NOTE_TICKS, DECK_TICKS, PPQ, BEATS_PER_BAR, SingleDeck, SharedDeckTransport, safeTempo, ticksToSeconds, playbackDurationSeconds } from './deck.ts';
+import type { AudioEngine, Instrument, OutputControls, VoiceLane } from './synth/contract.ts';
 import { FrequencyHistogramRecorder } from './frequency-history.ts';
+import { skipMissedMetronomeBeats } from './metronome-scheduler.ts';
+import { compileProgression, compileShorthandNotes, resolveSoundShorthand, type ProgressionBuildInput, type ShorthandNote, type SoundShorthand } from './music-agent.ts';
+import { MUSIC_PRESETS, NOTE_NAMES, SCALE_INTERVALS } from './music-catalog.ts';
 import { profileAtTransitionTick, profileTransitionProgress } from './profile-transition.ts';
-import type { AddDeckEvent, Cue, CueAction, DeckId, DeckProfileTransition, GlobalChordEvent, GlobalDrumEvent, GlobalNoteEvent, InstrumentControlState, LiveHeldState, LivePerformanceEvent, LivePerformanceState, LivePerformanceSummary, MusicClockSnapshot, MusicInstrument, MusicResult, MusicStateSnapshot, MusicalTime, RelativeBoundary, SoloEvent, SoloState, StoredSoloEvent, TransferState, TransferStyle } from './music-types.ts';
+import type { AddDeckEvent, Cue, CueAction, DeckId, DeckPreparationTrack, DeckProfileTransition, GlobalChordEvent, GlobalDrumEvent, GlobalNoteEvent, InstrumentControlState, LiveHeldState, LivePerformanceEvent, LivePerformanceState, LivePerformanceSummary, LiveSoundPatch, MusicClockSnapshot, MusicalContext, MusicInstrument, MusicResult, MusicStateSnapshot, MusicalTime, ProjectSettings, RelativeBoundary, RelativeSoloEvent, SoloEvent, SoloState, StoredSoloEvent, TransferState, TransferStyle } from './music-types.ts';
 
 export const CYCLE_BARS = 24;
 export const BAR_TICKS = PPQ * BEATS_PER_BAR;
+export const SOLO_OPENING_BARS = 2;
+export const SOLO_OPENING_TICKS = SOLO_OPENING_BARS * BAR_TICKS;
 export const CYCLE_TICKS = CYCLE_BARS * BAR_TICKS;
 export const MAX_MUSICAL_CYCLE = Math.floor(Number.MAX_SAFE_INTEGER / CYCLE_TICKS) - 1;
 export const MAX_ABSOLUTE_TICK = MAX_MUSICAL_CYCLE * CYCLE_TICKS + CYCLE_TICKS - 1;
 export const MAX_CUE_HORIZON_TICKS = CYCLE_TICKS * 64;
 export const LOOKAHEAD_SECONDS = .1;
 const CUE_INTERVAL_MS = 25;
+const METRONOME_INTERVAL_MS = 25;
 const MAX_HISTORY = 128;
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const isObject = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -45,7 +51,7 @@ export const quantizeMusicalTime = (time: MusicalTime, barBoundary = false): Mus
 export type CueTimingInput = { at?: MusicalTime; when?: RelativeBoundary };
 export type CueTimingResolution = { requestedAt: MusicalTime; resolvedAt: MusicalTime; normalisedAt: MusicalTime; earliestSafeTime: MusicalTime; earliestSafeAudioTime: number | null; boundary: RelativeBoundary | null };
 export const nextBoundaryAbsoluteTick = (absoluteTick: number, boundary: RelativeBoundary) => {
-  const step = boundary === 'next-eighth' ? EIGHTH_NOTE_TICKS : boundary === 'next-bar' ? BAR_TICKS : DECK_TICKS;
+  const step = boundary === 'next-safe' || boundary === 'next-eighth' ? EIGHTH_NOTE_TICKS : boundary === 'next-beat' ? PPQ : boundary === 'next-bar' ? BAR_TICKS : DECK_TICKS;
   return Math.floor(absoluteTick / step) * step + step;
 };
 
@@ -67,7 +73,8 @@ type Inverse =
   | { kind: 'enabled'; cueId: string; instrument: MusicInstrument; previous: boolean; expectedRevision: number }
   | { kind: 'transfer'; cueId: string; previousActive: DeckId; previousTransfer: TransferState | null; expectedRevision: number }
   | { kind: 'solo-state'; cueId: string; previous: SoloState | null; previousPlayed: string[]; expectedRevision: number }
-  | { kind: 'solo-add'; cueId: string; soloId: string; addedIds: string[]; expectedRevision: number };
+  | { kind: 'solo-add'; cueId: string; soloId: string; addedIds: string[]; expectedRevision: number }
+  | { kind: 'deck-prepare'; cueId: string; deck: DeckId; previous: ReturnType<SingleDeck['snapshot']>; expectedRevisions: Record<MusicInstrument, number> };
 type Transaction = { cueId: string; inverse: Inverse };
 type ReleaseProbe = { probeId: string; instrument: 'bass' | 'lead'; events: Array<{ at: number; releaseAt: number; releaseEnd: number; frequencyHz: number; durationMs: number }>; capture: { status: 'not-implemented'; reason: string } };
 export type HeldRetriggerOperation = { action: 'hold' | 'release'; id: string; intendedAudioTime: number; observedAudioTime?: number; driftMs?: number; before?: Record<string, unknown>; after?: Record<string, unknown>; result?: unknown };
@@ -125,6 +132,7 @@ export class MusicController {
   private transfer: TransferState | null = null;
   private transferTimer: number | null = null;
   private solo: SoloState | null = null;
+  private musicalContext: MusicalContext | null = null;
   private soloPlayed = new Set<string>();
   private humanRecording: HumanRecording = { active: false, deck: 'A', instrument: 'lead' };
   private humanRecordingInverse: HumanRecordingInverse | null = null;
@@ -136,9 +144,13 @@ export class MusicController {
   private heldRetriggerProbes = new Map<string, HeldRetriggerProbe>();
   private heldRetriggerTimers = new Map<string, number[]>();
   private disposed = false;
+  private metronomeTimer: number | null = null;
+  private projectSettings: ProjectSettings = { tempo: 120, keyRoot: 2, keyMode: 'minor', quantize: '1/8', metronomeEnabled: false, switchEffect: 'blend' };
 
   constructor(engine: AudioEngine) {
     this.engine = engine;
+    this.engine.tempo = this.projectSettings.tempo;
+    this.musicalContext = { label: 'Dm', root: 2, mode: 'minor', scalePitchClasses: SCALE_INTERVALS.minor.map((interval) => (2 + interval) % 12) };
     this.decks = { A: new SingleDeck(), B: new SingleDeck() };
     this.histogram = new FrequencyHistogramRecorder(engine);
     this.transport = new SharedDeckTransport(
@@ -177,6 +189,8 @@ export class MusicController {
         this.engine.setLaneGain('deckB', this.manualCrossfade <= 0 ? 0 : Math.sin(this.manualCrossfade * Math.PI / 2), now, .01);
       }
       this.histogram.start();
+      this.refreshMetronomeScheduler();
+      this.bump();
       return ok({ started: Boolean(this.engine.context), state: this.engine.context?.state ?? null }, 'Audio started.', 'AUDIO_STARTED');
     } catch (error) {
       return fail('AUDIO_START_FAILED', error instanceof Error ? error.message : 'The AudioContext could not start.');
@@ -200,6 +214,37 @@ export class MusicController {
     return ok(this.clockSnapshot(), 'The shared musical transport stopped and global time is frozen.', 'TRANSPORT_STOPPED');
   }
 
+  setTransport(running: boolean) {
+    return running ? this.startTransport() : Promise.resolve(this.stopTransport());
+  }
+
+  startRecordingTransport(startAt: number, instrument: MusicInstrument, replace: boolean) {
+    if (!Number.isFinite(startAt) || !isInstrument(instrument)) return fail('INVALID_RECORDING_TRANSPORT', 'Recording transport timing or instrument is invalid.');
+    this.transport.setMuted(instrument, replace);
+    if (!this.transport.start(startAt)) {
+      this.transport.setMuted(instrument, false);
+      return fail('CLOCK_START_FAILED', 'The shared recording transport could not start.');
+    }
+    return ok({ startAt, instrument, muted: replace }, 'The shared recording transport is running.', 'RECORDING_TRANSPORT_STARTED');
+  }
+
+  retimeRecordingTransport(startAt: number) {
+    if (!Number.isFinite(startAt)) return fail('INVALID_RECORDING_TRANSPORT', 'Recording transport timing is invalid.');
+    this.transport.retime(startAt);
+    return ok({ startAt }, 'The recording transport was retimed.', 'RECORDING_TRANSPORT_RETIMED');
+  }
+
+  setRecordingInstrumentMuted(instrument: MusicInstrument, muted: boolean) {
+    if (!isInstrument(instrument)) return fail('INVALID_INSTRUMENT', 'The recording instrument is invalid.');
+    this.transport.setMuted(instrument, muted);
+    return ok({ instrument, muted }, 'Recording track mute updated.', 'RECORDING_TRACK_MUTE_UPDATED');
+  }
+
+  catchUpRecordingEvents(deck: DeckId, instrument: MusicInstrument, events: Array<DrumEvent | NoteEvent | ChordEvent>) {
+    if (!this.validateDeck(deck) || !isInstrument(instrument)) return fail('INVALID_RECORDING_TRANSPORT', 'The recording deck or instrument is invalid.');
+    return ok({ scheduled: this.transport.catchUpCommittedEvents(deck, instrument, events) }, 'Committed recording events were scheduled.', 'RECORDING_EVENTS_SCHEDULED');
+  }
+
   getEarliestSafeTime() {
     const context = this.engine.context;
     const clock = this.clockSnapshot();
@@ -208,7 +253,10 @@ export class MusicController {
     const safeAudio = context.currentTime + LOOKAHEAD_SECONDS;
     const safeTick = Math.ceil(this.anchorAbsoluteTick + (safeAudio - this.anchorAudioTime) * ticksPerSecond);
     if (safeTick > MAX_ABSOLUTE_TICK) return fail('CUE_TOO_FAR', 'The earliest safe time exceeds the supported musical clock range.');
-    return ok({ earliestSafeTime: musicalTimeOf(safeTick), earliestSafeAudioTime: safeAudio, absoluteTick: safeTick, tempo: clock.tempo }, 'Earliest safe scheduling time.', 'EARLIEST_SAFE_TIME');
+    const nextSafeTick = nextBoundaryAbsoluteTick(safeTick - 1, 'next-safe');
+    const nextBeatTick = nextBoundaryAbsoluteTick(clock.absoluteTick, 'next-beat');
+    const nextBarTick = nextBoundaryAbsoluteTick(clock.absoluteTick, 'next-bar');
+    return ok({ earliestSafeTime: musicalTimeOf(safeTick), earliestSafeAudioTime: safeAudio, absoluteTick: safeTick, tempo: clock.tempo, boundaries: { nextSafe: musicalTimeOf(nextSafeTick), nextBeat: musicalTimeOf(nextBeatTick), nextBar: musicalTimeOf(nextBarTick) }, normalSoloStart: musicalTimeOf(nextBarTick), latestSoloStart: musicalTimeOf(nextBarTick) }, 'Earliest safe scheduling time.', 'EARLIEST_SAFE_TIME');
   }
 
   selectActiveDeck(deck: DeckId) {
@@ -525,7 +573,12 @@ export class MusicController {
       clock,
       decks: { A: this.decks.A.snapshot(), B: this.decks.B.snapshot() },
       instrumentEnabled: { ...this.enabled },
-      musicalKey: null,
+      musicalKey: this.musicalContext?.label ?? null,
+      musicalContext: this.musicalContext ? clone(this.musicalContext) : null,
+      projectSettings: clone(this.projectSettings),
+      audio: { ready: Boolean(this.engine.context), state: this.engine.context?.state ?? null },
+      liveSound: { presetIndexes: this.engine.getPresetIndexes(), controls: clone(this.engine.controls), volumes: clone(this.engine.volumes), output: clone(this.engine.outputControls) },
+      orchestration: { recommendedTargetDeck: this.activeDeck === 'A' ? 'B' : 'A', activeDeck: this.activeDeck, inactiveDeck: this.activeDeck === 'A' ? 'B' : 'A', normalSoloStart: 'next-bar', latestSoloStart: 'next-bar' },
       transfer: this.transfer ? { ...clone(this.transfer), progress: this.transferProgress(this.transfer) } : null,
       solo: this.solo ? clone(this.solo) : null,
       pendingCues: clone(this.pendingCues),
@@ -543,70 +596,389 @@ export class MusicController {
 
   buildSnapshot(app: Record<string, unknown> = {}) { return { schemaVersion: 3, exportedAt: new Date().toISOString(), page: typeof window === 'undefined' ? null : window.location.href, app: clone(app), synth: this.engine.getSynthSnapshot(), music: this.getState({ includeExecutedCues: true, includeParameters: true }), frequencyHistory: this.histogram.snapshot(10, true) }; }
 
+  setMusicalContext(context: MusicalContext) {
+    const pitchClasses = [...new Set(context.scalePitchClasses.map((pitch) => ((Math.round(pitch) % 12) + 12) % 12))];
+    this.musicalContext = { label: context.label, root: ((Math.round(context.root) % 12) + 12) % 12, mode: context.mode, scalePitchClasses: pitchClasses };
+    this.bump();
+  }
+
+  getProjectSettings() { return clone(this.projectSettings); }
+
+  setProjectSettings(patch: Partial<ProjectSettings>) {
+    if (!isObject(patch) || !exactKeys(patch, ['tempo', 'keyRoot', 'keyMode', 'quantize', 'metronomeEnabled', 'switchEffect'])) return fail('INVALID_PROJECT_SETTINGS', 'Project settings contain unknown fields.');
+    const next = { ...this.projectSettings, ...patch };
+    const validQuantize: QuantizeDivision[] = ['off', '1/4', '1/8', '1/16'];
+    const validStyle: TransferStyle[] = ['cut', 'blend', 'dip', 'overlap'];
+    if (!Number.isFinite(next.tempo) || next.tempo <= 0 || next.tempo > 999) return fail('INVALID_TEMPO', 'Tempo must be greater than 0 and no more than 999 BPM.');
+    if (!Number.isInteger(next.keyRoot) || next.keyRoot < 0 || next.keyRoot > 11) return fail('INVALID_KEY', 'keyRoot must be an integer from 0 to 11.');
+    if (next.keyMode !== 'major' && next.keyMode !== 'minor') return fail('INVALID_KEY', 'keyMode must be major or minor.');
+    if (!validQuantize.includes(next.quantize)) return fail('INVALID_QUANTIZE', 'quantize must be off, 1/4, 1/8, or 1/16.');
+    if (typeof next.metronomeEnabled !== 'boolean') return fail('INVALID_METRONOME', 'metronomeEnabled must be boolean.');
+    if (!validStyle.includes(next.switchEffect)) return fail('INVALID_SWITCH_EFFECT', 'switchEffect must be cut, blend, dip, or overlap.');
+    const previous = clone(this.projectSettings);
+    const tempoChanged = next.tempo !== previous.tempo;
+    if (tempoChanged) {
+      const before = this.clockSnapshot();
+      this.engine.tempo = next.tempo;
+      if (this.clockRunning && this.engine.context) {
+        this.anchorAudioTime = this.engine.context.currentTime;
+        this.anchorAbsoluteTick = before.absoluteTick;
+        this.anchorTempo = next.tempo;
+        this.transport.retime();
+      }
+    }
+    this.projectSettings = next;
+    const label = `${NOTE_NAMES[next.keyRoot]}${next.keyMode === 'minor' ? 'm' : ''}`;
+    this.musicalContext = { label, root: next.keyRoot, mode: next.keyMode, scalePitchClasses: SCALE_INTERVALS[next.keyMode].map((interval) => (next.keyRoot + interval) % 12) };
+    if (tempoChanged || next.metronomeEnabled !== previous.metronomeEnabled) this.refreshMetronomeScheduler();
+    this.bump();
+    return ok({ previous, current: clone(next) }, 'Project settings updated.', 'PROJECT_SETTINGS_UPDATED');
+  }
+
+  setCrossfader(position: number, style: TransferStyle = this.projectSettings.switchEffect) {
+    if (!Number.isFinite(position) || position < 0 || position > 1) return fail('INVALID_CROSSFADER', 'position must be between 0 and 1.');
+    if (!['cut', 'blend', 'dip', 'overlap'].includes(style)) return fail('INVALID_SWITCH_EFFECT', 'style must be cut, blend, dip, or overlap.');
+    this.projectSettings = { ...this.projectSettings, switchEffect: style };
+    const applied = this.humanSetCrossfade(position, style);
+    return ok({ position: applied, style, activeDeck: this.activeDeck }, 'Crossfader updated immediately.', 'CROSSFADER_UPDATED');
+  }
+
+  clearDeck(deck: DeckId, selectedInstruments: MusicInstrument[] = instruments) {
+    if (!this.validateDeck(deck)) return fail('INVALID_DECK', 'Deck must be A or B.');
+    if (!Array.isArray(selectedInstruments) || selectedInstruments.length < 1 || new Set(selectedInstruments).size !== selectedInstruments.length || selectedInstruments.some((instrument) => !isInstrument(instrument))) return fail('INVALID_INSTRUMENTS', 'Provide one or more unique musical instruments.');
+    const previous = this.decks[deck].snapshot();
+    if (selectedInstruments.length === instruments.length) this.decks[deck].clear();
+    else selectedInstruments.forEach((instrument) => this.decks[deck].clearInstrument(instrument));
+    selectedInstruments.forEach((instrument) => { this.profileTransitions.delete(this.profileKey(deck, instrument)); this.bumpTarget(deck, instrument); });
+    const operationId = makeCueId();
+    const expectedRevisions = Object.fromEntries(instruments.map((instrument) => [instrument, this.targetRevision(deck, instrument)])) as Record<MusicInstrument, number>;
+    this.transactions.push({ cueId: operationId, inverse: { kind: 'deck-prepare', cueId: operationId, deck, previous, expectedRevisions } });
+    this.trimHistory(this.transactions);
+    this.bump();
+    return ok({ operationId, deck, instruments: [...selectedInstruments] }, `Deck ${deck} cleared.`, 'DECK_CLEARED');
+  }
+
+  setLiveSound(patch: LiveSoundPatch) {
+    if (!isObject(patch) || !exactKeys(patch, ['instrument', 'presetId', 'controls', 'parameters', 'volume', 'drumModel'])) return fail('INVALID_SOUND_PATCH', 'Sound settings contain unknown fields.');
+    const instrument = patch.instrument;
+    if (!['drums', 'bass', 'chords', 'lead', 'metronome'].includes(instrument)) return fail('INVALID_INSTRUMENT', 'instrument is invalid.');
+    const presetIndex = patch.presetId === undefined ? undefined : MUSIC_PRESETS[instrument].findIndex((preset) => preset.toLowerCase() === patch.presetId!.toLowerCase());
+    if (presetIndex === -1) return fail('INVALID_PRESET', `Unknown ${instrument} preset.`);
+    if (patch.controls !== undefined && (!isObject(patch.controls) || Object.entries(patch.controls).some(([name, value]) => !(name in this.engine.controls[instrument]) || !this.validNumber(value, 0, 1)))) return fail('INVALID_CONTROLS', 'Every control must be known and between 0 and 1.');
+    if (patch.parameters !== undefined && (!isObject(patch.parameters) || Object.entries(patch.parameters).some(([name, value]) => { const parameter = this.engine.parameters[instrument][name]; return !parameter || !this.validNumber(value, parameter.min, parameter.max); }))) return fail('INVALID_PARAMETERS', 'Every parameter must be known and inside its declared range.');
+    if (patch.volume !== undefined && !this.validNumber(patch.volume, 0, 1)) return fail('INVALID_VOLUME', 'volume must be between 0 and 1.');
+    if (patch.drumModel !== undefined && (instrument !== 'drums' || !['layered', 'noisy', 'electronic'].includes(patch.drumModel))) return fail('INVALID_DRUM_MODEL', 'drumModel is only valid for drums.');
+    if (presetIndex !== undefined) this.engine.loadPreset(instrument, presetIndex);
+    Object.entries(patch.controls ?? {}).forEach(([name, value]) => this.engine.setControl(instrument, name, value));
+    Object.entries(patch.parameters ?? {}).forEach(([name, value]) => this.engine.setParameter(instrument, name, value));
+    if (patch.volume !== undefined) this.engine.setVolume(instrument, patch.volume);
+    if (patch.drumModel !== undefined) this.engine.setDrumModel(patch.drumModel);
+    this.bump();
+    return ok({ instrument, presetIndex: this.engine.getPresetIndexes()[instrument], presetId: MUSIC_PRESETS[instrument][this.engine.getPresetIndexes()[instrument]], controls: clone(this.engine.controls[instrument]), volume: this.engine.volumes[instrument] }, `${instrument} sound updated.`, 'LIVE_SOUND_UPDATED');
+  }
+
+  resetLiveParameter(instrument: Instrument, presetIndex: number, name: string) {
+    if (!['drums', 'bass', 'chords', 'lead', 'metronome'].includes(instrument) || !Number.isInteger(presetIndex) || presetIndex < 0 || presetIndex >= MUSIC_PRESETS[instrument].length || !(name in this.engine.parameters[instrument])) return fail('INVALID_PARAMETER', 'The parameter reset target is invalid.');
+    this.engine.resetParameter(instrument, presetIndex, name);
+    this.bump();
+    return ok({ instrument, name, value: this.engine.parameters[instrument][name].value }, 'Parameter reset.', 'PARAMETER_RESET');
+  }
+
+  setOutput(patch: Partial<OutputControls>) {
+    if (!isObject(patch) || !exactKeys(patch, ['masterVolume', 'eqLowDb', 'eqMidDb', 'eqHighDb', 'echoTimeMs', 'echoFeedback', 'echoMix'])) return fail('INVALID_OUTPUT', 'Output settings contain unknown fields.');
+    const ranges: Record<keyof OutputControls, [number, number]> = { masterVolume: [0, 1], eqLowDb: [-12, 12], eqMidDb: [-12, 12], eqHighDb: [-12, 12], echoTimeMs: [40, 900], echoFeedback: [0, .75], echoMix: [0, 1] };
+    const invalid = Object.entries(patch).find(([name, value]) => { const range = ranges[name as keyof OutputControls]; return !range || !this.validNumber(value, range[0], range[1]); });
+    if (invalid) return fail('INVALID_OUTPUT', `${invalid[0]} is outside its allowed range.`);
+    Object.entries(patch).forEach(([name, value]) => this.engine.setOutputControl(name as keyof OutputControls, value));
+    this.bump();
+    return ok({ output: clone(this.engine.outputControls) }, 'Output controls updated.', 'OUTPUT_UPDATED');
+  }
+
+  getCatalog() {
+    const parameters = Object.fromEntries((Object.keys(MUSIC_PRESETS) as Instrument[]).map((instrument) => [instrument, Object.fromEntries(Object.entries(this.engine.parameters[instrument]).map(([name, parameter]) => [name, { label: parameter.label, min: parameter.min, max: parameter.max, step: parameter.step, unit: parameter.unit }]))]));
+    return { presets: clone(MUSIC_PRESETS), controls: Object.fromEntries((Object.keys(MUSIC_PRESETS) as Instrument[]).map((instrument) => [instrument, Object.keys(this.engine.controls[instrument])])), parameters, shorthand: { degrees: [1, 2, 3, 4, 5, 6, 7], romanDegrees: ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii°'], durations: ['1/8', '1/4', '1/2', '1bar'], drumNames: ['kick', 'snare', 'closed-hat', 'open-hat', 'clap', 'low-tom', 'high-tom', 'perc', 'rim', 'shaker', 'cowbell', 'ride'], drumPatterns: ['none', 'backbeat', 'four-on-floor', 'half-time'], bassPatterns: ['none', 'roots', 'pulses'], chordPatterns: ['none', 'sustained', 'stabs'] }, project: { keyRoots: NOTE_NAMES, keyModes: ['major', 'minor'], quantize: ['off', '1/4', '1/8', '1/16'], switchEffects: ['cut', 'blend', 'dip', 'overlap'] }, output: { masterVolume: [0, 1], eqDb: [-12, 12], echoTimeMs: [40, 900], echoFeedback: [0, .75], echoMix: [0, 1] } };
+  }
+
+  getLivePerformance(options: { sinceSequence?: number; maxEvents?: number } = {}) {
+    const clock = this.clockSnapshot();
+    return this.livePerformanceSnapshot(true, options.sinceSequence, options.maxEvents ?? 32, clock.absoluteTick);
+  }
+
+  getAgentBrief(options: { liveSinceSequence?: number; maxLiveEvents?: number } = {}) {
+    const state = this.getState({ includeLiveEvents: true, liveSinceSequence: options.liveSinceSequence, maxLiveEvents: options.maxLiveEvents ?? 12 });
+    const nextBarTick = nextBoundaryAbsoluteTick(state.clock.absoluteTick, 'next-bar');
+    const ticksUntilNextBar = Math.max(0, nextBarTick - state.clock.absoluteTick);
+    const secondsUntilNextBar = ticksUntilNextBar * 60 / (PPQ * state.clock.tempo);
+    const estimatedTokensPerBarAt30Tps = Math.round(7200 / state.clock.tempo);
+    const activeChords = state.decks[state.activeDeck].events.chords.map((event) => event.symbol);
+    const actions: Array<Record<string, unknown>> = [];
+    if (!state.audio.ready) actions.push({ tool: 'music_initialize_audio', arguments: { startTransport: true }, reason: 'Audio must exist before timed actions.' });
+    else if (!state.clock.running) actions.push({ tool: 'music_set_transport', arguments: { running: true }, reason: 'The musical clock is stopped.' });
+    actions.push({ tool: 'music_fill_inactive_deck', arguments: { progression: [1, 4, 1, 5], drums: 'backbeat', bass: 'roots', chords: 'sustained' }, reason: `Build Deck ${state.orchestration.inactiveDeck} without calculating pitches or ticks.` });
+    actions.push({ tool: 'music_start_guided_solo', arguments: { soloId: 'solo-1', instrument: 'lead', lengthBars: 4, when: 'next-bar', openingNotes: [{ bar: 1, degree: 1, duration: '1/4' }, { bar: 2, degree: 3, duration: '1/4' }] }, reason: 'For the fastest start, send only the first two bars. Later bars are accepted but take longer to stage.' });
+    return {
+      protocolVersion: 3,
+      stateVersion: state.stateVersion,
+      project: { tempo: state.clock.tempo, key: state.musicalKey, mode: state.projectSettings.keyMode, quantize: state.projectSettings.quantize, metronomeEnabled: state.projectSettings.metronomeEnabled },
+      transport: { running: state.clock.running, current: state.clock.current, activeDeck: state.activeDeck, inactiveDeck: state.orchestration.inactiveDeck, crossfadePosition: state.crossfadePosition, nextBar: musicalTimeOf(nextBarTick) },
+      timing: { secondsUntilNextBar: Number(secondsUntilNextBar.toFixed(3)), estimatedTokensPerBarAt30Tps, rule: 'Prepare arguments first. During timed work, call tools at once without narration or another state read.' },
+      harmony: { currentChord: state.currentChord?.event.symbol ?? null, upcomingChord: state.upcomingChord?.event.symbol ?? null, activeDeckProgression: activeChords },
+      humanPlaying: { latestSequence: state.livePerformance.latestSequence, held: state.livePerformance.held, summary: state.livePerformance.summary, recentEvents: state.livePerformance.recentEvents },
+      solo: state.solo ? { soloId: state.solo.soloId, status: state.solo.status, instrument: state.solo.instrument, start: state.solo.start, lengthBars: state.solo.lengthBars } : null,
+      pendingCues: state.pendingCues.map((cue) => ({ cueId: cue.id, at: cue.normalisedAt, action: cue.action.type, status: cue.status })),
+      recommendedActions: actions,
+    };
+  }
+
+  buildProgression(deck: DeckId, input: ProgressionBuildInput) {
+    if (!this.validateDeck(deck)) return fail('INVALID_DECK', 'Deck must be A or B.', { retryWith: { tool: 'music_fill_inactive_deck', arguments: input } });
+    for (const [instrument, shorthand] of Object.entries(input.sounds ?? {}) as Array<['drums' | 'bass' | 'chords', SoundShorthand]>) {
+      if (!resolveSoundShorthand(instrument, shorthand)) return fail('INVALID_PRESET', `Unknown ${instrument} preset.`, { retryWith: { tool: 'music_get_agent_brief', arguments: {} } });
+    }
+    const compiled = compileProgression(input, this.projectSettings.keyRoot, this.projectSettings.keyMode);
+    if (!compiled || compiled.tracks.length === 0) return fail('INVALID_PROGRESSION', 'Provide one to four valid scale degrees and at least one enabled arrangement lane.', { retryWith: { tool: 'music_build_progression', arguments: { deck, progression: [1, 4, 1, 5], drums: 'backbeat', bass: 'roots', chords: 'sustained' } } });
+    const prepared = this.prepareDeck(deck, compiled.tracks);
+    if (!prepared.ok) return { ...prepared, data: { ...(isObject(prepared.data) ? prepared.data : {}), retryWith: { tool: deck === this.activeDeck ? 'music_fill_inactive_deck' : 'music_build_progression', arguments: deck === this.activeDeck ? input : { deck, ...input } } } };
+    return ok({ ...prepared.data, degrees: compiled.degrees, chords: compiled.chords.map((chord) => chord.symbol), generatedEvents: compiled.tracks.reduce((count, track) => count + track.events.length, 0), nextActions: [{ tool: 'music_cue_transfer', arguments: { destination: deck, style: this.projectSettings.switchEffect, durationTicks: BAR_TICKS, when: 'next-bar' } }] }, `Deck ${deck} built from scale degrees.`, 'PROGRESSION_BUILT');
+  }
+
+  fillInactiveDeck(input: ProgressionBuildInput) {
+    const deck: DeckId = this.activeDeck === 'A' ? 'B' : 'A';
+    return this.buildProgression(deck, input);
+  }
+
+  startGuidedSolo(input: { soloId: string; instrument: 'bass' | 'lead'; lengthBars: number; description?: string; when?: RelativeBoundary; sound?: SoundShorthand; openingNotes: ShorthandNote[] }) {
+    const retryWith = { tool: 'music_start_guided_solo', arguments: { ...input, when: 'next-bar', openingNotes: [{ bar: 1, degree: 1, duration: '1/4' }, { bar: 2, degree: 3, duration: '1/4' }] } };
+    const profile = resolveSoundShorthand(input.instrument, input.sound);
+    if (!profile) return fail('INVALID_PRESET', `Unknown ${input.instrument} preset.`, { retryWith });
+    const events = compileShorthandNotes(input.openingNotes, input.instrument, this.projectSettings.keyRoot, this.projectSettings.keyMode);
+    if (!events) return fail('INVALID_SOLO_EVENTS', 'openingNotes contain invalid shorthand.', { retryWith });
+    const opening = events.filter((event) => event.offsetTicks < SOLO_OPENING_TICKS);
+    const later = events.filter((event) => event.offsetTicks >= SOLO_OPENING_TICKS);
+    const started = this.queueAction({ when: input.when ?? 'next-bar' }, { type: 'start-solo', soloId: input.soloId, instrument: input.instrument, description: input.description ?? 'Guided solo', lengthBars: input.lengthBars, soundProfile: profile, initialEvents: opening });
+    if (!started.ok) return { ...started, data: { ...(isObject(started.data) ? started.data : {}), retryWith } };
+    if (later.length > 0) {
+      const staged = this.stageSoloEvents(input.soloId, later);
+      if (!staged.ok) {
+        this.cancelCue(started.data!.cueId);
+        return { ...staged, data: { ...(isObject(staged.data) ? staged.data : {}), retryWith } };
+      }
+    }
+    return ok({ ...started.data, openingEventCount: opening.length, stagedEventCount: later.length, usedExtendedInput: later.length > 0 }, later.length > 0 ? 'Solo queued; the first two bars start it and later notes were staged.' : 'Solo queued from its two-bar opening.', 'CUE_ACCEPTED');
+  }
+
+  scheduleSection(input: { soloId: string; instrument: 'bass' | 'lead'; lengthBars: number; description?: string; when?: RelativeBoundary; sound?: SoundShorthand; notes: ShorthandNote[]; transfer?: { destination?: DeckId; afterBars: number; style?: TransferStyle; durationBeats?: number } }) {
+    const retryWith = { tool: 'music_schedule_section', arguments: { ...input, when: 'next-bar' } };
+    const profile = resolveSoundShorthand(input.instrument, input.sound);
+    const events = compileShorthandNotes(input.notes, input.instrument, this.projectSettings.keyRoot, this.projectSettings.keyMode);
+    if (!profile) return fail('INVALID_PRESET', `Unknown ${input.instrument} preset.`, { retryWith });
+    if (!events) return fail('INVALID_SOLO_EVENTS', 'Section notes contain invalid shorthand.', { retryWith });
+    const opening = events.filter((event) => event.offsetTicks < SOLO_OPENING_TICKS);
+    const later = events.filter((event) => event.offsetTicks >= SOLO_OPENING_TICKS);
+    const started = this.queueAction({ when: input.when ?? 'next-bar' }, { type: 'start-solo', soloId: input.soloId, instrument: input.instrument, description: input.description ?? 'Scheduled section', lengthBars: input.lengthBars, soundProfile: profile, initialEvents: opening });
+    if (!started.ok) return { ...started, data: { ...(isObject(started.data) ? started.data : {}), retryWith } };
+    if (later.length > 0) {
+      const staged = this.stageSoloEvents(input.soloId, later);
+      if (!staged.ok) { this.cancelCue(started.data!.cueId); return { ...staged, data: { ...(isObject(staged.data) ? staged.data : {}), retryWith } }; }
+    }
+    let transferCueId: string | null = null;
+    if (input.transfer) {
+      const afterBars = input.transfer.afterBars;
+      const durationBeats = input.transfer.durationBeats ?? 1;
+      if (!Number.isInteger(afterBars) || afterBars < 1 || afterBars > input.lengthBars || !Number.isFinite(durationBeats) || durationBeats < 0 || durationBeats > 16) { this.cancelCue(started.data!.cueId); return fail('INVALID_SECTION_TRANSFER', 'Transfer timing must lie inside the section and use 0-16 beats.', { retryWith }); }
+      const destination = input.transfer.destination ?? (this.activeDeck === 'A' ? 'B' : 'A');
+      const transferAt = musicalTimeOf(absoluteTickOf(started.data!.normalisedAt) + afterBars * BAR_TICKS);
+      const transfer = this.queueAction(transferAt, { type: 'transfer-deck', destination, style: input.transfer.style ?? this.projectSettings.switchEffect, durationTicks: Math.round(durationBeats * PPQ) });
+      if (!transfer.ok) { this.cancelCue(started.data!.cueId); return { ...transfer, data: { ...(isObject(transfer.data) ? transfer.data : {}), retryWith } }; }
+      transferCueId = transfer.data!.cueId;
+    }
+    return ok({ soloCueId: started.data!.cueId, transferCueId, start: started.data!.normalisedAt, lengthBars: input.lengthBars, eventCount: events.length, openingEventCount: opening.length, stagedEventCount: later.length, nextActions: [{ tool: 'music_get_agent_brief', arguments: { liveSinceSequence: this.liveSequence } }] }, 'Section scheduled atomically.', 'SECTION_SCHEDULED');
+  }
+
+  private refreshMetronomeScheduler() {
+    if (this.metronomeTimer !== null && typeof window !== 'undefined') window.clearInterval(this.metronomeTimer);
+    this.metronomeTimer = null;
+    const context = this.engine.context;
+    if (!this.projectSettings.metronomeEnabled || !context || typeof window === 'undefined') return;
+    let beat = 0;
+    const beatLength = 60 / safeTempo(this.projectSettings.tempo);
+    let nextBeat = context.currentTime + .05;
+    const schedule = () => {
+      const now = this.engine.context?.currentTime ?? 0;
+      const recovered = skipMissedMetronomeBeats({ beat, nextBeat }, now, beatLength);
+      beat = recovered.beat;
+      nextBeat = recovered.nextBeat;
+      while (nextBeat <= now + .1) { this.engine.metronome(beat % 4 === 0, nextBeat); beat += 1; nextBeat += beatLength; }
+    };
+    schedule();
+    this.metronomeTimer = window.setInterval(schedule, METRONOME_INTERVAL_MS);
+  }
+
+  prepareDeck(deck: DeckId, tracks: DeckPreparationTrack[]) {
+    if (!this.validateDeck(deck)) return fail('INVALID_DECK', 'Deck must be A or B.');
+    const inactiveDeck: DeckId = this.activeDeck === 'A' ? 'B' : 'A';
+    if (deck !== inactiveDeck) return fail('ACTIVE_DECK_REQUIRES_CUE', 'music_prepare_deck only changes the silent inactive deck. Use the timed cue tools for the active deck.', { activeDeck: this.activeDeck, recommendedTargetDeck: inactiveDeck, nextActions: [{ tool: 'music_prepare_deck', deck: inactiveDeck }, { tool: 'music_cue_replace_deck_events', deck: this.activeDeck, when: 'next-safe' }] });
+    if (!Array.isArray(tracks) || tracks.length < 1 || tracks.length > instruments.length) return fail('INVALID_DECK_PREPARATION', 'Provide one to four deck tracks.');
+    if (this.transfer?.status === 'active' || (deck === 'A' ? 1 - this.manualCrossfade : this.manualCrossfade) > .001) return fail('DECK_NOT_SILENT', 'The target deck is still audible. Wait until the crossfade reaches the other deck before preparing it.', { crossfadePosition: this.manualCrossfade, nextActions: [{ tool: 'music_get_state', reason: 'Check again after the transfer finishes.' }] });
+    if (tracks.some((track) => !isObject(track) || !exactKeys(track, ['instrument', 'mode', 'events', 'profile']) || !Array.isArray(track.events))) return fail('INVALID_DECK_PREPARATION', 'Every track must contain only instrument, mode, events, and an optional profile.');
+    const trackNames = tracks.map((track) => track.instrument);
+    if (new Set(trackNames).size !== trackNames.length || trackNames.some((instrument) => !isInstrument(instrument))) return fail('INVALID_DECK_PREPARATION', 'Each instrument may appear at most once.');
+    const previous = this.decks[deck].snapshot();
+    const projected = new SingleDeck();
+    projected.restore(previous);
+    const prepared = tracks.map((track) => ({ ...clone(track), events: track.events.map((event) => ({ ...event, id: event.id ?? makeAgentEventId(event.type) })) }));
+    for (let trackIndex = 0; trackIndex < prepared.length; trackIndex += 1) {
+      const track = prepared[trackIndex];
+      if ((track.mode !== 'add' && track.mode !== 'replace') || !Array.isArray(track.events) || track.events.length > 256) return fail('INVALID_DECK_PREPARATION', 'Each track needs add or replace mode and at most 256 events.', undefined, [{ path: `tracks[${trackIndex}]`, code: 'INVALID', message: 'Invalid track mode or event count.' }]);
+      if (track.profile && !this.validateProfile(track.profile, track.instrument).ok) return fail('INVALID_PROFILE', 'A prepared track profile must be complete and match its instrument.', undefined, [{ path: `tracks[${trackIndex}].profile`, code: 'INVALID', message: 'Invalid sound profile.' }]);
+      if (track.mode === 'replace') projected.clearInstrument(track.instrument);
+      for (let eventIndex = 0; eventIndex < track.events.length; eventIndex += 1) {
+        const event = track.events[eventIndex];
+        const validation = this.validateDeckEvent(event, track.instrument);
+        if (!validation.ok) return fail('INVALID_DECK_EVENTS', 'A prepared deck event is invalid.', undefined, this.eventIssues(eventIndex, validation, 'Invalid prepared event.').map((issue) => ({ ...issue, path: `tracks[${trackIndex}].${issue.path}` })));
+        if (event.id && projected.hasAnyEventId(event.id)) return fail('DUPLICATE_EVENT_ID', `Event ID ${event.id} is already present in the prepared deck.`);
+        this.addDeckEventTo(projected, track.instrument, event);
+      }
+      if (track.profile) projected.setSoundProfile(track.instrument, track.profile);
+    }
+    this.decks[deck].restore(projected.snapshot());
+    prepared.forEach((track) => {
+      this.profileTransitions.delete(this.profileKey(deck, track.instrument));
+      this.bumpTarget(deck, track.instrument);
+      if (track.instrument === 'bass' && track.profile) this.engine.updateBassLaneProfile(laneForDeck(deck), track.profile);
+    });
+    const cueId = makeCueId();
+    const expectedRevisions = Object.fromEntries(instruments.map((instrument) => [instrument, this.targetRevision(deck, instrument)])) as Record<MusicInstrument, number>;
+    this.transactions.push({ cueId, inverse: { kind: 'deck-prepare', cueId, deck, previous, expectedRevisions } });
+    this.trimHistory(this.transactions);
+    this.bump();
+    return ok({ operationId: cueId, deck, tracks: prepared.map((track) => ({ instrument: track.instrument, mode: track.mode, eventCount: track.events.length, profile: track.profile?.presetId ?? null })), nextActions: [{ tool: 'music_prepare_deck', reason: 'Add or revise more inactive-deck tracks atomically.' }, { tool: 'music_cue_transfer', reason: 'Transfer only after the deck is ready.', destination: deck, when: 'next-bar' }] }, `Deck ${deck} prepared atomically.`, 'DECK_PREPARED');
+  }
+
+  stageSoloEvents(soloId: string, relativeEvents: RelativeSoloEvent[]) {
+    const pending = this.pendingCues.find((cue) => (cue.action.type === 'start-solo' || cue.action.type === 'create-solo') && cue.action.soloId === soloId) as (Cue & { action: Extract<CueAction, { type: 'start-solo' | 'create-solo' }> }) | undefined;
+    const active = this.solo?.soloId === soloId && this.solo.status === 'active' ? this.solo : null;
+    if (!pending && !active) return fail('SOLO_NOT_FOUND', 'No pending or active solo has this ID.', { nextActions: [{ tool: 'music_cue_start_solo', when: 'next-bar' }] });
+    if (!Array.isArray(relativeEvents) || relativeEvents.length < 1 || relativeEvents.length > 256) return fail('INVALID_SOLO_EVENTS', 'Provide 1-256 relative solo events.');
+    const startAbsoluteTick = pending ? absoluteTickOf(pending.normalisedAt) : active!.startAbsoluteTick;
+    const endAbsoluteTick = pending ? startAbsoluteTick + pending.action.lengthBars * BAR_TICKS : active!.endAbsoluteTick;
+    const instrument = pending ? pending.action.instrument : active!.instrument;
+    const events: SoloEvent[] = [];
+    for (let index = 0; index < relativeEvents.length; index += 1) {
+      const input = relativeEvents[index];
+      if (!isObject(input) || !this.validInteger(input.offsetTicks, 0, CYCLE_TICKS) || input.offsetTicks % EIGHTH_NOTE_TICKS !== 0) return fail('INVALID_SOLO_OFFSET', 'Each offsetTicks value must be a nonnegative eighth-note grid offset.', undefined, [{ path: `events[${index}].offsetTicks`, code: 'INVALID', message: 'Use a multiple of 240 ticks.' }]);
+      if (input.offsetTicks < SOLO_OPENING_TICKS) return fail('SOLO_OPENING_LOCKED', 'The first two solo bars are fixed by music_cue_start_solo. Stage later phrases from bar 3 onward.', { minimumOffsetTicks: SOLO_OPENING_TICKS }, [{ path: `events[${index}].offsetTicks`, code: 'OPENING_LOCKED', message: `Use an offset of at least ${SOLO_OPENING_TICKS} ticks.` }]);
+      const start = startAbsoluteTick + input.offsetTicks;
+      if (start < startAbsoluteTick || start >= endAbsoluteTick) return fail('SOLO_EVENT_OUTSIDE_WINDOW', 'A relative solo event starts outside the solo window.', undefined, [{ path: `events[${index}].offsetTicks`, code: 'OUTSIDE_WINDOW', message: 'Offset must land before the solo end.' }]);
+      const { offsetTicks: _offsetTicks, ...rest } = input;
+      const event = { ...clone(rest), id: input.id ?? makeAgentEventId('solo'), start: musicalTimeOf(start) } as SoloEvent;
+      const validation = this.validateSoloEvent(event);
+      if (!validation.ok) return fail('INVALID_SOLO_EVENTS', 'A relative solo event is invalid.', undefined, this.eventIssues(index, validation, 'Invalid relative solo event.'));
+      if (!this.soloEventMatchesInstrument(event, instrument)) return fail('SOLO_INSTRUMENT_MISMATCH', 'Every staged event must match the solo instrument.', undefined, [{ path: `events[${index}]`, code: 'INSTRUMENT_MISMATCH', message: `Expected ${instrument}.` }]);
+      if (event.type !== 'drum' && start + event.durationTicks > endAbsoluteTick) return fail('SOLO_EVENT_OUTSIDE_WINDOW', 'A staged note or chord may not cross the solo end.');
+      events.push(event);
+    }
+    const existingIds = new Set(active?.events.map((event) => event.id) ?? (pending?.action.type === 'create-solo' ? pending.action.events.flatMap((event) => event.id ? [event.id] : []) : []));
+    if (events.some((event) => event.id && existingIds.has(event.id)) || new Set(events.map((event) => event.id)).size !== events.length) return fail('DUPLICATE_EVENT_ID', 'Staged solo event IDs must be unique.');
+    const clock = this.clockSnapshot();
+    const minimumLegalAbsolute = Math.ceil((clock.absoluteTick + (this.clockRunning ? LOOKAHEAD_SECONDS * PPQ * clock.tempo / 60 : 0)) / EIGHTH_NOTE_TICKS) * EIGHTH_NOTE_TICKS;
+    const minimumLegalOffsetTicks = Math.max(0, minimumLegalAbsolute - startAbsoluteTick);
+    if (events.some((event) => absoluteTickOf(event.start) < minimumLegalAbsolute)) return fail('SOLO_EVENT_TOO_LATE', 'One or more staged events have entered the audio safety window.', { minimumLegalEventTime: musicalTimeOf(minimumLegalAbsolute), minimumLegalOffsetTicks, nextActions: [{ tool: 'music_stage_solo_events', soloId, minimumOffsetTicks: minimumLegalOffsetTicks }] });
+    if (pending) {
+      const action = pending.action;
+      pending.action = action.type === 'start-solo' ? { ...action, type: 'create-solo', events } : { ...action, events: [...action.events, ...events] };
+      this.bump();
+      return ok({ soloId, cueId: pending.id, state: 'pending', added: events.map((event) => event.id), start: pending.normalisedAt, minimumLegalOffsetTicks: 0, nextActions: [{ tool: 'music_stage_solo_events', reason: 'Add later phrases before they enter the safety window.', soloId }] }, 'Solo events staged before the solo starts.', 'SOLO_EVENTS_STAGED');
+    }
+    const stored = events.map((event) => this.normaliseSoloEvent(event).data!);
+    this.solo = { ...active!, events: [...active!.events, ...stored].sort((left, right) => absoluteTickOf(left.start) - absoluteTickOf(right.start)) };
+    this.soloRevision += 1;
+    const operationId = makeCueId();
+    this.transactions.push({ cueId: operationId, inverse: { kind: 'solo-add', cueId: operationId, soloId, addedIds: stored.map((event) => event.id), expectedRevision: this.soloRevision } });
+    this.trimHistory(this.transactions);
+    this.scheduleSolo((this.engine.context?.currentTime ?? 0) + LOOKAHEAD_SECONDS);
+    this.bump();
+    return ok({ soloId, operationId, state: 'active', added: stored.map((event) => event.id), minimumLegalOffsetTicks, nextActions: [{ tool: 'music_stage_solo_events', reason: 'Continue with the next phrase.', soloId, minimumOffsetTicks: minimumLegalOffsetTicks }] }, 'Solo events added to the active solo.', 'SOLO_EVENTS_STAGED');
+  }
+
   private resolveCueTiming(input: MusicalTime | CueTimingInput, actionType: CueAction['type']): MusicResult<CueTimingResolution> {
     const timing = isMusicalTime(input) ? { at: input } : input;
     if (!isObject(timing)) return fail('INVALID_TIMING', 'Provide exactly one of at or when.', undefined, [{ path: 'timing', code: 'REQUIRED', message: 'Exactly one of at or when is required.' }]);
     const keys = Object.keys(timing);
     if (keys.some((key) => key !== 'at' && key !== 'when') || ('at' in timing && 'when' in timing) || !('at' in timing) && !('when' in timing)) return fail('INVALID_TIMING', 'Provide exactly one of at or when.', undefined, [{ path: 'timing', code: 'ONE_OF', message: 'Exactly one of at or when is required.' }]);
-    let boundary: RelativeBoundary | null = null;
-    let requestedAt: MusicalTime;
-    let rawTarget: number;
-    if ('when' in timing) {
-      if (timing.when !== 'next-eighth' && timing.when !== 'next-bar' && timing.when !== 'next-four-bar-boundary') return fail('INVALID_TIMING', 'when must be one of next-eighth, next-bar, or next-four-bar-boundary.', undefined, [{ path: 'when', code: 'ENUM', message: 'Unsupported relative boundary.' }]);
-      boundary = timing.when;
-      const clock = this.clockSnapshot();
-      requestedAt = musicalTimeOf(Math.floor(clock.absoluteTick));
-      rawTarget = nextBoundaryAbsoluteTick(clock.absoluteTick, boundary);
-    } else {
-      if (!isMusicalTime(timing.at)) return fail('INVALID_MUSICAL_TIME', 'at must contain a safe cycle, bar, and tick.', undefined, [{ path: 'at', code: 'INVALID', message: 'cycle, bar, and tick must be safe integers.' }]);
-      requestedAt = clone(timing.at);
-      rawTarget = absoluteTickOf(timing.at);
-    }
-    const barBoundary = ['set-instrument-enabled', 'set-deck-sound-profile', 'transfer-deck', 'start-solo', 'create-solo'].includes(actionType);
-    const grid = barBoundary ? BAR_TICKS : EIGHTH_NOTE_TICKS;
-    const normalisedAbsolute = Math.ceil(rawTarget / grid) * grid;
     const context = this.engine.context;
     const clock = this.clockSnapshot();
     const earliestSafeAudioTime = context && clock.running ? context.currentTime + LOOKAHEAD_SECONDS : null;
     const ticksPerSecond = PPQ * clock.tempo / 60;
     const earliestSafeAbsolute = context && clock.running ? Math.ceil(this.anchorAbsoluteTick + (earliestSafeAudioTime! - this.anchorAudioTime) * ticksPerSecond) : Math.floor(clock.absoluteTick);
+    let boundary: RelativeBoundary | null = null;
+    let requestedAt: MusicalTime;
+    let rawTarget: number;
+    if ('when' in timing) {
+      if (timing.when !== 'next-safe' && timing.when !== 'next-eighth' && timing.when !== 'next-beat' && timing.when !== 'next-bar' && timing.when !== 'next-four-bar-boundary') return fail('INVALID_TIMING', 'when must be next-safe, next-eighth, next-beat, next-bar, or next-four-bar-boundary.', undefined, [{ path: 'when', code: 'ENUM', message: 'Unsupported relative boundary.' }]);
+      boundary = timing.when;
+      requestedAt = musicalTimeOf(Math.floor(clock.absoluteTick));
+      rawTarget = nextBoundaryAbsoluteTick(boundary === 'next-safe' ? Math.max(clock.absoluteTick, earliestSafeAbsolute - 1) : clock.absoluteTick, boundary);
+    } else {
+      if (!isMusicalTime(timing.at)) return fail('INVALID_MUSICAL_TIME', 'at must contain a safe cycle, bar, and tick.', undefined, [{ path: 'at', code: 'INVALID', message: 'cycle, bar, and tick must be safe integers.' }]);
+      requestedAt = clone(timing.at);
+      rawTarget = absoluteTickOf(timing.at);
+    }
+    const defaultBarBoundary = ['set-instrument-enabled', 'set-deck-sound-profile', 'transfer-deck', 'start-solo', 'create-solo'].includes(actionType);
+    const grid = boundary ? (boundary === 'next-four-bar-boundary' ? DECK_TICKS : boundary === 'next-bar' ? BAR_TICKS : boundary === 'next-beat' ? PPQ : EIGHTH_NOTE_TICKS) : defaultBarBoundary ? BAR_TICKS : EIGHTH_NOTE_TICKS;
+    const normalisedAbsolute = Math.ceil(rawTarget / grid) * grid;
     if (normalisedAbsolute > MAX_ABSOLUTE_TICK || earliestSafeAbsolute > MAX_ABSOLUTE_TICK) return fail('CUE_TOO_FAR', 'The cue normalises beyond the supported musical clock range.', { requestedAt, resolvedAt: musicalTimeOf(Math.min(MAX_ABSOLUTE_TICK, Math.max(0, rawTarget))), earliestSafeTime: musicalTimeOf(MAX_ABSOLUTE_TICK), boundary });
     const normalisedAt = musicalTimeOf(normalisedAbsolute);
     const earliestSafeTime = musicalTimeOf(earliestSafeAbsolute);
-    if (context && clock.running && this.audioTimeAt(normalisedAbsolute) < earliestSafeAudioTime!) return fail('CUE_TOO_LATE', 'The cue is inside the safe scheduling window and was not executed immediately.', { requestedAt, resolvedAt: normalisedAt, normalisedAt, earliestSafeTime, boundary });
+    if (context && clock.running && this.audioTimeAt(normalisedAbsolute) < earliestSafeAudioTime!) return fail('CUE_TOO_LATE', 'The cue is inside the safe scheduling window and was not executed immediately.', { requestedAt, resolvedAt: normalisedAt, normalisedAt, earliestSafeTime, boundary, suggestedWhen: 'next-safe' });
     return ok({ requestedAt, resolvedAt: normalisedAt, normalisedAt, earliestSafeTime, earliestSafeAudioTime, boundary }, 'Cue timing resolved.');
   }
 
-  queueAction(timingInput: MusicalTime | CueTimingInput, action: CueAction): MusicResult<{ cueId: string; requestedAt: MusicalTime; resolvedAt: MusicalTime; normalisedAt: MusicalTime; earliestSafeTime: MusicalTime; boundary: RelativeBoundary | null; status: Cue['status']; summary: string }> {
+  queueAction(timingInput: MusicalTime | CueTimingInput, action: CueAction): MusicResult<{ cueId: string; requestedAt: MusicalTime; resolvedAt: MusicalTime; normalisedAt: MusicalTime; earliestSafeTime: MusicalTime; boundary: RelativeBoundary | null; status: Cue['status']; summary: string; nextActions: Array<Record<string, unknown>> }> {
     const validation = this.validateAction(action);
     if (!validation.ok) return fail(validation.code, validation.message, undefined, validation.issues);
     if (!this.engine.context) return fail('AUDIO_NOT_STARTED', 'Start audio before queuing a musical cue.');
     if (!this.clockRunning || !this.transport.isPlaying()) return fail('CLOCK_NOT_RUNNING', 'Start the shared musical transport before queuing a cue.');
     if (this.conflictsWithHumanRecording(action)) return fail('HUMAN_RECORDING_CONFLICT', 'The cue would change the instrument currently being recorded.');
-    const preparedAction = this.normaliseActionIds(action);
     const timing = this.resolveCueTiming(timingInput, action.type);
     if (!timing.ok) return fail(timing.code, timing.message, timing.data, timing.issues);
     const { requestedAt, resolvedAt, normalisedAt, earliestSafeTime, boundary } = timing.data!;
-    if (this.hasPendingEventIdCollision(preparedAction)) return fail('DUPLICATE_EVENT_ID', 'An event ID is already committed or reserved by another pending cue on this deck.');
     const current = this.clockSnapshot().absoluteTick;
     const target = absoluteTickOf(normalisedAt);
+    const materialisedAction: CueAction = action.type === 'start-solo'
+      ? {
+          type: 'create-solo',
+          soloId: action.soloId,
+          instrument: action.instrument,
+          description: action.description,
+          lengthBars: action.lengthBars,
+          soundProfile: action.soundProfile,
+          events: action.initialEvents.map(({ offsetTicks, ...event }) => ({ ...event, start: musicalTimeOf(target + offsetTicks) } as SoloEvent)),
+        }
+      : action;
+    const preparedAction = this.normaliseActionIds(materialisedAction);
+    if (this.hasPendingEventIdCollision(preparedAction)) return fail('DUPLICATE_EVENT_ID', 'An event ID is already committed or reserved by another pending cue on this deck.');
     if ((action.type === 'start-solo' || action.type === 'create-solo') && target + action.lengthBars * BAR_TICKS > MAX_ABSOLUTE_TICK) return fail('CUE_TOO_FAR', 'The solo would extend beyond the supported musical clock range.', { requestedAt, resolvedAt, earliestSafeTime });
     if (target - current > MAX_CUE_HORIZON_TICKS) return fail('CUE_TOO_FAR', 'The cue is beyond the supported scheduling horizon.');
     if (action.type === 'add-solo-events') {
       if (this.solo?.soloId === action.soloId && this.solo.status === 'active') {
         const mismatch = action.events.findIndex((event) => !this.soloEventMatchesInstrument(event, this.solo!.instrument));
         if (mismatch >= 0) return fail('SOLO_INSTRUMENT_MISMATCH', 'Every incremental solo event must match the active solo instrument.', undefined, [{ path: `events[${mismatch}]`, code: 'INSTRUMENT_MISMATCH', message: 'The event type or note instrument does not match the active solo instrument.' }]);
+        const openingEnd = this.solo.startAbsoluteTick + SOLO_OPENING_TICKS;
+        if (action.events.some((event) => absoluteTickOf(quantizeMusicalTime(event.start)) < openingEnd)) return fail('SOLO_OPENING_LOCKED', 'The first two solo bars are fixed by the atomic opening buffer.', { minimumLegalEventTime: musicalTimeOf(openingEnd) });
       }
       const minimumLegalAbsolute = Math.ceil((target + (timing.data?.earliestSafeAudioTime === null ? 0 : LOOKAHEAD_SECONDS * PPQ * this.engine.tempo / 60)) / EIGHTH_NOTE_TICKS) * EIGHTH_NOTE_TICKS;
       const tooSoon = action.events.some((event) => absoluteTickOf(quantizeMusicalTime(event.start)) < minimumLegalAbsolute);
       if (tooSoon) return fail('SOLO_EVENT_TOO_LATE', 'Incremental solo events must start after the cue execution safety window.', { minimumLegalEventTime: musicalTimeOf(minimumLegalAbsolute), requestedAt, resolvedAt, earliestSafeTime });
     }
-    if (action.type === 'create-solo') {
-      const soloEnd = target + action.lengthBars * BAR_TICKS;
-      for (const event of action.events) {
+    if (preparedAction.type === 'create-solo') {
+      const soloEnd = target + preparedAction.lengthBars * BAR_TICKS;
+      for (const event of preparedAction.events) {
         const start = absoluteTickOf(quantizeMusicalTime(event.start));
         if (start < target || start >= soloEnd || (event.type !== 'drum' && start + event.durationTicks > soloEnd)) return fail('SOLO_EVENT_OUTSIDE_WINDOW', 'Atomic solo events must fit inside the solo window and may start at its boundary.');
       }
+      const openingBars = new Set(preparedAction.events.map((event) => Math.floor((absoluteTickOf(quantizeMusicalTime(event.start)) - target) / BAR_TICKS)).filter((bar) => bar >= 0 && bar < SOLO_OPENING_BARS));
+      if (openingBars.size < SOLO_OPENING_BARS) return fail('SOLO_OPENING_INCOMPLETE', 'The atomic solo must contain at least one event onset in each of its first two bars.');
     }
     // A later transfer replaces an earlier pending/scheduled transfer. Cancel
     // its timer and AudioParam ramps before accepting the replacement so two
@@ -622,7 +994,10 @@ export class MusicController {
     this.pendingCues.push(cue);
     this.startCuePump();
     this.bump();
-    return ok({ cueId: cue.id, requestedAt: clone(requestedAt), resolvedAt: clone(resolvedAt), normalisedAt: clone(normalisedAt), earliestSafeTime: clone(earliestSafeTime), boundary, status: cue.status, summary: this.actionSummary(action) }, 'Cue accepted.', 'CUE_ACCEPTED');
+    const nextActions = action.type === 'start-solo' || action.type === 'create-solo'
+      ? [{ tool: 'music_stage_solo_events', reason: 'The first two bars are already safe. Add later phrases from bar 3 onward without pausing to narrate or reread state.', soloId: action.soloId, minimumOffsetTicks: SOLO_OPENING_TICKS }]
+      : action.type === 'transfer-deck' ? [{ tool: 'music_get_state', reason: 'Confirm the transfer and choose the newly inactive deck for the next build.' }] : [];
+    return ok({ cueId: cue.id, requestedAt: clone(requestedAt), resolvedAt: clone(resolvedAt), normalisedAt: clone(normalisedAt), earliestSafeTime: clone(earliestSafeTime), boundary, status: cue.status, summary: this.actionSummary(action), nextActions }, 'Cue accepted.', 'CUE_ACCEPTED');
   }
 
   executeCueNow(cueIdValue: string, scheduledAudioAt?: number): MusicResult<unknown> {
@@ -857,6 +1232,7 @@ export class MusicController {
 
   dispose() {
     if (this.disposed) return; this.disposed = true; this.transport.stop(); this.histogram.stop(); this.clearHumanHeldSilently();
+    if (this.metronomeTimer !== null && typeof window !== 'undefined') window.clearInterval(this.metronomeTimer); this.metronomeTimer = null;
     if (this.cueTimer !== null && typeof window !== 'undefined') window.clearInterval(this.cueTimer); this.cueTimer = null;
     this.cueTimers.forEach((timer) => { if (typeof window !== 'undefined') window.clearTimeout(timer); }); this.cueTimers.clear(); [...this.preScheduledAudio.keys()].forEach((cueId) => this.cancelPreScheduledAudio(cueId)); this.heldRetriggerTimers.forEach((timers, probeId) => { timers.forEach((timer) => { if (typeof window !== 'undefined') window.clearTimeout(timer); else clearTimeout(timer as unknown as ReturnType<typeof setTimeout>); }); const probe = this.heldRetriggerProbes.get(probeId); if (probe) { probe.status = 'cancelled'; probe.failure = 'Controller disposed during probe.'; } }); this.heldRetriggerTimers.clear(); this.heldRetriggerProbes.forEach((probe) => [probe.requested.firstId, probe.requested.secondId].forEach((id) => { if (typeof id === 'string' && this.engine.hasHeldNote(id)) this.engine.releaseNote(id); })); this.clearTransferTimer(); this.listeners.clear(); this.engine.dispose();
   }
@@ -907,9 +1283,27 @@ export class MusicController {
     if (action.type === 'set-instrument-enabled') return exactKeys(action, ['type', 'instrument', 'enabled']) && isInstrument(action.instrument) && typeof action.enabled === 'boolean' ? ok(true, 'Valid action.') : fail('INVALID_INSTRUMENT_STATE', 'Instrument and enabled state are required.');
     if (action.type === 'set-deck-sound-profile') { if (!exactKeys(action, ['type', 'deck', 'instrument', 'profile', 'transitionTicks']) || !this.validateDeck(action.deck) || !isInstrument(action.instrument) || !this.validateProfile(action.profile, action.instrument).ok || (action.transitionTicks !== undefined && !this.validInteger(action.transitionTicks, 0, CYCLE_TICKS))) return fail('INVALID_PROFILE', 'Deck, instrument, profile, or transition length is invalid.'); return ok(true, 'Valid action.'); }
     if (action.type === 'transfer-deck') return exactKeys(action, ['type', 'destination', 'style', 'durationTicks']) && this.validateDeck(action.destination) && (action.style === 'cut' || action.style === 'blend' || action.style === 'dip' || action.style === 'overlap') && this.validInteger(action.durationTicks, 0, CYCLE_TICKS) ? ok(true, 'Valid action.') : fail('INVALID_TRANSFER', 'Transfer destination, style, and integer duration are required.');
-    if (action.type === 'start-solo') return exactKeys(action, ['type', 'soloId', 'instrument', 'description', 'lengthBars', 'soundProfile']) && stringId(action.soloId) && isInstrument(action.instrument) && typeof action.description === 'string' && action.description.length > 0 && action.description.length <= 240 && this.validInteger(action.lengthBars, 1, CYCLE_BARS) && this.validateProfile(action.soundProfile, action.instrument).ok ? ok(true, 'Valid action.') : fail('INVALID_SOLO', 'Solo details or sound profile are invalid.');
+    if (action.type === 'start-solo') {
+      if (!exactKeys(action, ['type', 'soloId', 'instrument', 'description', 'lengthBars', 'soundProfile', 'initialEvents']) || !stringId(action.soloId) || !isInstrument(action.instrument) || typeof action.description !== 'string' || action.description.length < 1 || action.description.length > 240 || !this.validInteger(action.lengthBars, SOLO_OPENING_BARS, CYCLE_BARS) || !this.validateProfile(action.soundProfile, action.instrument).ok || !Array.isArray(action.initialEvents) || action.initialEvents.length < SOLO_OPENING_BARS || action.initialEvents.length > 256) return fail('INVALID_SOLO', 'Solo details, profile, and a two-bar opening buffer are required.');
+      const ids = new Set<string>();
+      const coveredBars = new Set<number>();
+      for (let index = 0; index < action.initialEvents.length; index += 1) {
+        const input = action.initialEvents[index];
+        if (!isObject(input) || !this.validInteger(input.offsetTicks, 0, SOLO_OPENING_TICKS - EIGHTH_NOTE_TICKS) || input.offsetTicks % EIGHTH_NOTE_TICKS !== 0) return fail('INVALID_SOLO_OPENING', 'Opening events must start on the eighth-note grid inside the first two bars.', undefined, [{ path: `initialEvents[${index}].offsetTicks`, code: 'OUTSIDE_OPENING', message: `Use a grid offset from 0 through ${SOLO_OPENING_TICKS - EIGHTH_NOTE_TICKS}.` }]);
+        const { offsetTicks, ...relativeEvent } = input;
+        const event = { ...relativeEvent, start: musicalTimeOf(offsetTicks) } as SoloEvent;
+        const eventValidation = this.validateSoloEvent(event);
+        if (!eventValidation.ok) return fail('INVALID_SOLO_OPENING', 'An opening event is invalid.', undefined, this.eventIssues(index, eventValidation, 'Invalid opening event.').map((issue) => ({ ...issue, path: issue.path.replace(/^events/, 'initialEvents') })));
+        if (!this.soloEventMatchesInstrument(event, action.instrument)) return fail('SOLO_INSTRUMENT_MISMATCH', 'Every opening event must match the solo instrument.', undefined, [{ path: `initialEvents[${index}]`, code: 'INSTRUMENT_MISMATCH', message: `Expected ${action.instrument}.` }]);
+        if (event.type !== 'drum' && offsetTicks + event.durationTicks > action.lengthBars * BAR_TICKS) return fail('SOLO_EVENT_OUTSIDE_WINDOW', 'An opening note or chord may not cross the solo end.');
+        if (event.id && ids.has(event.id)) return fail('DUPLICATE_EVENT_ID', 'Opening event IDs must be unique.');
+        if (event.id) ids.add(event.id);
+        coveredBars.add(Math.floor(offsetTicks / BAR_TICKS));
+      }
+      return coveredBars.size === SOLO_OPENING_BARS ? ok(true, 'Valid action.') : fail('SOLO_OPENING_INCOMPLETE', 'The opening buffer must contain at least one event onset in each of the first two bars.');
+    }
     if (action.type === 'create-solo') {
-      if (!exactKeys(action, ['type', 'soloId', 'instrument', 'description', 'lengthBars', 'soundProfile', 'events']) || !stringId(action.soloId) || !isInstrument(action.instrument) || typeof action.description !== 'string' || action.description.length < 1 || action.description.length > 240 || !this.validInteger(action.lengthBars, 1, CYCLE_BARS) || !this.validateProfile(action.soundProfile, action.instrument).ok || !Array.isArray(action.events) || action.events.length < 1 || action.events.length > 256) return fail('INVALID_SOLO', 'Atomic solo details, profile, and 1-256 events are required.');
+      if (!exactKeys(action, ['type', 'soloId', 'instrument', 'description', 'lengthBars', 'soundProfile', 'events']) || !stringId(action.soloId) || !isInstrument(action.instrument) || typeof action.description !== 'string' || action.description.length < 1 || action.description.length > 240 || !this.validInteger(action.lengthBars, SOLO_OPENING_BARS, CYCLE_BARS) || !this.validateProfile(action.soundProfile, action.instrument).ok || !Array.isArray(action.events) || action.events.length < SOLO_OPENING_BARS || action.events.length > 256) return fail('INVALID_SOLO', 'Atomic solo details, profile, and a two-bar opening buffer are required.');
       const invalidEvent = action.events.findIndex((event) => !this.validateSoloEvent(event).ok);
       if (invalidEvent >= 0) {
         const validation = this.validateSoloEvent(action.events[invalidEvent]);
@@ -1133,7 +1527,18 @@ export class MusicController {
     else { if (!audioAlreadyScheduled) { this.engine.cancelLaneGainAutomation(laneForDeck('A'), audioAt); this.engine.cancelLaneGainAutomation(laneForDeck('B'), audioAt); this.scheduleTransferGains(from, action.destination, action.style, audioAt, duration); } const revision = this.transferRevision; if (typeof window !== 'undefined') this.transferTimer = window.setTimeout(() => { if (this.transfer && this.transferRevision === revision) { this.activeDeck = action.destination; this.manualCrossfade = action.destination === 'A' ? 0 : 1; this.transfer = { ...this.transfer, progress: 1, status: 'complete' }; this.bump(); } }, Math.max(0, (audioAt + duration - (this.engine.context?.currentTime ?? audioAt)) * 1000)); }
     return { result: ok({ cueId: cue.id, from, destination: action.destination, style: action.style, durationTicks: action.durationTicks, progress: this.transfer.progress }, 'Deck transfer started.', 'TRANSFER_STARTED'), inverse: { kind: 'transfer', cueId: cue.id, previousActive: from, previousTransfer, expectedRevision: this.transferRevision } as Inverse };
   }
-  private applyStartSolo(action: Extract<CueAction, { type: 'start-solo' }>, cue: Cue) { if (this.solo?.status === 'active') return fail('SOLO_ALREADY_ACTIVE', 'Only one solo can be active.'); const startAbsoluteTick = absoluteTickOf(cue.normalisedAt); const previous = this.solo ? clone(this.solo) : null; const previousPlayed = [...this.soloPlayed]; this.solo = { soloId: action.soloId, instrument: action.instrument, description: action.description, start: cue.normalisedAt, startAbsoluteTick, endAbsoluteTick: startAbsoluteTick + action.lengthBars * BAR_TICKS, lengthBars: action.lengthBars, soundProfile: clone(action.soundProfile), events: [], status: 'active' }; this.soloPlayed.clear(); this.soloRevision += 1; this.startCuePump(); return { result: ok({ cueId: cue.id, soloId: action.soloId, start: cue.normalisedAt, endAbsoluteTick: this.solo.endAbsoluteTick }, 'Empty solo buffer started.', 'SOLO_STARTED'), inverse: { kind: 'solo-state', cueId: cue.id, previous, previousPlayed, expectedRevision: this.soloRevision } as Inverse }; }
+  private applyStartSolo(action: Extract<CueAction, { type: 'start-solo' }>, cue: Cue) {
+    const startAbsoluteTick = absoluteTickOf(cue.normalisedAt);
+    return this.applyCreateSolo({
+      type: 'create-solo',
+      soloId: action.soloId,
+      instrument: action.instrument,
+      description: action.description,
+      lengthBars: action.lengthBars,
+      soundProfile: action.soundProfile,
+      events: action.initialEvents.map(({ offsetTicks, ...event }) => ({ ...event, id: event.id ?? makeAgentEventId('solo'), start: musicalTimeOf(startAbsoluteTick + offsetTicks) } as SoloEvent)),
+    }, cue);
+  }
   private applyCreateSolo(action: Extract<CueAction, { type: 'create-solo' }>, cue: Cue, audioAlreadyScheduled = false) {
     if (this.solo?.status === 'active') return fail('SOLO_ALREADY_ACTIVE', 'Only one solo can be active.');
     const previous = this.solo ? clone(this.solo) : null;
@@ -1169,6 +1574,15 @@ export class MusicController {
   private normaliseSoloEvent(event: SoloEvent): MusicResult<StoredSoloEvent> { const valid = this.validateSoloEvent(event); if (!valid.ok) return fail<StoredSoloEvent>(valid.code, valid.message, undefined, valid.issues); const start = quantizeMusicalTime(event.start); const id = event.id ?? `solo-event-${nextSoloEventId++}`; return ok({ ...clone(event), id, start } as StoredSoloEvent, 'Valid solo event.'); }
 
   private applyInverse(inverse: Inverse): MusicResult<unknown> {
+    if (inverse.kind === 'deck-prepare') {
+      const unchanged = instruments.every((instrument) => this.targetRevision(inverse.deck, instrument) === inverse.expectedRevisions[instrument]);
+      if (!unchanged) return fail('UNDO_CONFLICT', 'A later change touched the prepared deck.');
+      this.decks[inverse.deck].restore(inverse.previous);
+      instruments.forEach((instrument) => { this.profileTransitions.delete(this.profileKey(inverse.deck, instrument)); this.bumpTarget(inverse.deck, instrument); });
+      const bassProfile = inverse.previous.profiles.bass;
+      if (bassProfile) this.engine.updateBassLaneProfile(laneForDeck(inverse.deck), bassProfile);
+      return ok(true, 'Atomic deck preparation reversed.');
+    }
     if (inverse.kind === 'deck-add') { const current = this.decks[inverse.deck].events(inverse.instrument); const conflicting = inverse.replaced.some((old) => current.some((event) => event.startTick === old.startTick && !inverse.added.some((added) => added.id === event.id))); if (conflicting) return fail('UNDO_CONFLICT', 'A later human event occupies a bass slot changed by the agent.'); const removed = this.decks[inverse.deck].removeExactEvents(inverse.instrument, inverse.added); if (removed.length !== inverse.added.length) return fail('UNDO_CONFLICT', 'A later change modified an agent event.'); this.decks[inverse.deck].restoreEvents(inverse.instrument, inverse.replaced); this.bumpTarget(inverse.deck, inverse.instrument); return ok(true, 'Agent deck additions reversed.'); }
     if (inverse.kind === 'deck-remove' || inverse.kind === 'deck-replace') {
       // Remove/replace inverses merge by exact event ID. A later human event

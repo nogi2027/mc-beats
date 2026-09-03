@@ -99,7 +99,9 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
 
 .platters { position: relative; grid-column: 2; display: grid; grid-template-columns: 1fr 1fr; align-items: center; padding: 7px 0 4px; }
 .deck { position: relative; display: grid; place-items: center; min-width: 0; }
-.deck-clear { position: absolute; left: 12px; bottom: calc((100% - 330px) / 2); z-index: 5; display: grid; width: 24px; height: 24px; padding: 0; place-items: center; border: 1px solid var(--ink); border-radius: 50%; background: var(--card); color: var(--ink); font: 600 1rem/1 'DM Mono', monospace; box-shadow: inset 0 1px 0 var(--highlight), 0 2px 0 var(--shadow-step); }
+.deck-clear { display: grid; width: 100%; height: 30px; padding: 3px 2px; place-items: center; border: 1px solid var(--ink); border-radius: var(--radius); background: var(--card); color: var(--ink); font: 600 .34rem/1.05 'DM Mono', monospace; box-shadow: inset 0 1px 0 var(--highlight), 0 3px 0 var(--shadow-step); }
+.deck-clear span { white-space: nowrap; font-size: .4rem; }
+.deck-clear b { color: var(--muted); font-size: .52rem; }
 .deck-clear:hover:not(:disabled), .deck-clear:focus-visible { color: #fff; background: var(--output); }
 .deck-clear:disabled { cursor: not-allowed; opacity: .28; }
 .platter { position: relative; width: 330px; aspect-ratio: 1; overflow: hidden; border: var(--line) solid var(--ink); border-radius: 50%; outline: 1px solid var(--border-soft); outline-offset: -9px; background: var(--surface); box-shadow: inset 0 0 0 5px var(--edge), 0 5px 0 var(--shadow-step), 0 9px 11px #0003; }
@@ -114,7 +116,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-v
 .lane-lead path { stroke: var(--lead); } .lane-drums path { stroke: var(--drums); } .lane-bass path { stroke: var(--bass); } .lane-chords path { stroke: var(--chords); stroke-width: 5; }
 .platter-arcs .lane-off { filter: grayscale(1); opacity: .16; }
 .arc-chord { fill: #fff; stroke: none; font: 700 3.3px 'DM Mono', monospace; letter-spacing: .15px; paint-order: stroke; }
-.deck-meta { position: absolute; left: -114px; bottom: 14px; z-index: 20; display: grid; grid-template-rows: repeat(5, minmax(0, 1fr)); width: 106px; height: 225px; gap: 7px; font-family: 'DM Mono', monospace; }
+.deck-meta { position: absolute; left: -114px; bottom: 14px; z-index: 20; display: grid; grid-template-rows: repeat(5, minmax(0, 1fr)) 30px; width: 106px; height: 260px; gap: 7px; font-family: 'DM Mono', monospace; }
+.deck-clear-controls { display: grid; grid-template-columns: repeat(2, 1fr); align-items: center; justify-items: center; gap: 7px; }
 .deck-meta > button, .deck-meta > label, .deck-meta > .deck-setting { display: grid; grid-template-columns: 1fr auto; align-items: center; width: 100%; padding: 8px 7px; border: 1px solid var(--ink); border-radius: var(--radius); background: var(--card); text-align: left; box-shadow: inset 0 1px 0 var(--highlight), 0 3px 0 var(--shadow-step), 0 5px 5px #0002; }
 .deck-meta > .theme-setting { grid-template-columns: auto 1fr auto; gap: 6px; justify-items: center; padding-inline: 8px; color: var(--muted); font: 600 .4rem 'DM Mono', monospace; letter-spacing: .03em; }
 .theme-setting span.active { color: var(--ink); }

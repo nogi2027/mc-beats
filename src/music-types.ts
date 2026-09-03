@@ -1,16 +1,53 @@
-import type { DeckInstrument, DeckSoundProfile, DrumEvent, NoteEvent, ChordEvent, DeckSnapshot } from './deck.ts';
+import type { DeckInstrument, DeckSoundProfile, DrumEvent, NoteEvent, ChordEvent, DeckSnapshot, QuantizeDivision } from './deck.ts';
+import type { Instrument, OutputControls } from './synth/contract.ts';
 
 export type DeckId = 'A' | 'B';
 export type MusicInstrument = DeckInstrument;
 export type MusicalTime = { cycle: number; bar: number; tick: number };
 export type TransferStyle = 'cut' | 'blend' | 'dip' | 'overlap';
 export type CueStatus = 'pending' | 'scheduled' | 'executed' | 'cancelled' | 'failed';
-export type RelativeBoundary = 'next-eighth' | 'next-bar' | 'next-four-bar-boundary';
+export type RelativeBoundary = 'next-safe' | 'next-eighth' | 'next-beat' | 'next-bar' | 'next-four-bar-boundary';
+
+export type MusicalContext = {
+  label: string;
+  root: number;
+  mode: 'major' | 'minor';
+  scalePitchClasses: number[];
+};
+
+export type ProjectSettings = {
+  tempo: number;
+  keyRoot: number;
+  keyMode: 'major' | 'minor';
+  quantize: QuantizeDivision;
+  metronomeEnabled: boolean;
+  switchEffect: TransferStyle;
+};
+
+export type LiveSoundPatch = {
+  instrument: Instrument;
+  presetId?: string;
+  controls?: Record<string, number>;
+  parameters?: Record<string, number>;
+  volume?: number;
+  drumModel?: 'layered' | 'noisy' | 'electronic';
+};
 
 export type GlobalDrumEvent = Omit<DrumEvent, 'startTick' | 'id'> & { type: 'drum'; id?: string; start: MusicalTime };
 export type GlobalNoteEvent = Omit<NoteEvent, 'startTick' | 'id'> & { type: 'note'; id?: string; instrument: 'bass' | 'lead'; start: MusicalTime };
 export type GlobalChordEvent = Omit<ChordEvent, 'startTick' | 'id'> & { type: 'chord'; id?: string; start: MusicalTime };
 export type SoloEvent = GlobalDrumEvent | GlobalNoteEvent | GlobalChordEvent;
+export type RelativeSoloEvent =
+  | (Omit<GlobalDrumEvent, 'start'> & { offsetTicks: number })
+  | (Omit<GlobalNoteEvent, 'start'> & { offsetTicks: number })
+  | (Omit<GlobalChordEvent, 'start'> & { offsetTicks: number });
+
+export type DeckPreparationTrack = {
+  instrument: MusicInstrument;
+  mode: 'add' | 'replace';
+  events: AddDeckEvent[];
+  profile?: DeckSoundProfile;
+};
 export type StoredSoloEvent =
   | (Omit<GlobalDrumEvent, 'id'> & { id: string })
   | (Omit<GlobalNoteEvent, 'id'> & { id: string })
@@ -28,7 +65,7 @@ export type CueAction =
   | { type: 'set-instrument-enabled'; instrument: MusicInstrument; enabled: boolean }
   | { type: 'set-deck-sound-profile'; deck: DeckId; instrument: MusicInstrument; profile: DeckSoundProfile; transitionTicks?: number }
   | { type: 'transfer-deck'; destination: DeckId; style: TransferStyle; durationTicks: number }
-  | { type: 'start-solo'; soloId: string; instrument: MusicInstrument; description: string; lengthBars: number; soundProfile: DeckSoundProfile }
+  | { type: 'start-solo'; soloId: string; instrument: MusicInstrument; description: string; lengthBars: number; soundProfile: DeckSoundProfile; initialEvents: RelativeSoloEvent[] }
   | { type: 'create-solo'; soloId: string; instrument: MusicInstrument; description: string; lengthBars: number; soundProfile: DeckSoundProfile; events: SoloEvent[] }
   | { type: 'add-solo-events'; soloId: string; events: SoloEvent[] }
   | { type: 'end-solo-early'; soloId: string };
@@ -151,6 +188,22 @@ export type MusicStateSnapshot = {
   decks: Record<DeckId, DeckSnapshot>;
   instrumentEnabled: Record<MusicInstrument, boolean>;
   musicalKey: string | null;
+  musicalContext: MusicalContext | null;
+  projectSettings: ProjectSettings;
+  audio: { ready: boolean; state: AudioContextState | null };
+  liveSound: {
+    presetIndexes: Record<Instrument, number>;
+    controls: Record<Instrument, Record<string, number>>;
+    volumes: Record<Instrument, number>;
+    output: OutputControls;
+  };
+  orchestration: {
+    recommendedTargetDeck: DeckId;
+    activeDeck: DeckId;
+    inactiveDeck: DeckId;
+    normalSoloStart: RelativeBoundary;
+    latestSoloStart: RelativeBoundary;
+  };
   transfer: TransferState | null;
   solo: SoloState | null;
   pendingCues: Cue[];
