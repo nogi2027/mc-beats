@@ -3,3 +3,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+
+# Local planning notes; keep these out of published source.
+interactions.md
+intro-draft.txt
+synth_mvp_plan.md
